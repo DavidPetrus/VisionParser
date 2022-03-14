@@ -31,21 +31,26 @@ def normalize_image(image):
     return image
 
 
-def random_crop_resize(image):
-    c,h,w = image.shape
+def random_crop_resize(image, crop_dims=None):
+    c, img_h, img_w = image.shape
 
-    crop_h,crop_w = np.random.uniform(FLAGS.min_crop,FLAGS.max_crop,size=(2,))
-    c_h,c_w = int(h*crop_h)//8, int(w*crop_w)//8
-    crop_x,crop_y = np.random.randint(0,w//8-c_w), np.random.randint(0,h//8-c_h)
-    crop = image[:,crop_y*8:crop_y*8+c_h*8, crop_x*8:crop_x*8+c_w*8]
+    if crop_dims is None:
+        crop_size = np.random.uniform(FLAGS.min_crop,min(img_h/img_w,img_w/img_h))
+        crop_size = int(max(img_h,img_w)*crop_size)
+        crop_x,crop_y = np.random.randint(0,img_w-crop_size), np.random.randint(0,img_h-crop_size)
+    else:
+        crop_size = int(max(img_h,img_w)*crop_dims[2])
+        crop_x, crop_y = int(crop_dims[0]*img_w), int(crop_dims[1]*img_h)
+
+    crop = image[:,crop_y:crop_y+crop_size, crop_x:crop_x+crop_size]
 
     #resize_frac = np.random.uniform(FLAGS.min_resize,FLAGS.max_resize,size=(1,))[0]
     #t_size = (int(c_h*resize_frac),int(c_w*resize_frac))
     #resized = F.interpolate(crop.unsqueeze(0),size=(t_size[0]*8,t_size[1]*8),mode='bilinear',align_corners=True)
 
-    return crop.unsqueeze(0), [crop_x,crop_y,c_w,c_h]
+    return crop
 
-def color_distortion(brightness=0.8, contrast=0.8, saturation=0.8, hue=0.2):
+def color_distortion(brightness=0.7, contrast=0.7, saturation=0.7, hue=0.2):
     color_jitter = torchvision.transforms.ColorJitter(brightness,contrast,saturation,hue)
     return color_jitter
 
