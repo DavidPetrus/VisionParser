@@ -14,7 +14,7 @@ FLAGS = flags.FLAGS
 IMAGENET_DEFAULT_MEAN = (255*0.485, 255*0.456, 255*0.406)
 IMAGENET_DEFAULT_STD = (255*0.229, 255*0.224, 255*0.225)
 
-color = np.random.randint(0,256,[5120,3],dtype=np.uint8)
+#color = np.random.randint(0,256,[5120,3],dtype=np.uint8)
 
 def resize_image(image, max_patch_size):
     height, width, _ = image.shape
@@ -24,19 +24,19 @@ def resize_image(image, max_patch_size):
 
     return image[lu[0]:lu[0]+new_height, lu[1]:lu[1]+new_width]
 
+
 def normalize_image(image):
     image = image.float()
-    image /= 255.
 
-    return image
+    return image/255.
 
 
-def random_crop_resize(image, crop_dims=None):
+def random_crop(image, crop_dims=None):
     c, img_h, img_w = image.shape
 
     if crop_dims is None:
         crop_size = np.random.uniform(FLAGS.min_crop,min(img_h/img_w,img_w/img_h))
-        crop_size = int(max(img_h,img_w)*crop_size)
+        crop_size = int(min(img_h,img_w)*crop_size)
         crop_x,crop_y = np.random.randint(0,img_w-crop_size), np.random.randint(0,img_h-crop_size)
     else:
         crop_size = int(max(img_h,img_w)*crop_dims[2])
@@ -50,7 +50,8 @@ def random_crop_resize(image, crop_dims=None):
 
     return crop
 
-def color_distortion(brightness=0.7, contrast=0.7, saturation=0.7, hue=0.2):
+
+def color_distortion(brightness=0.7, contrast=0.7, saturation=0.7, hue=0.15):
     color_jitter = torchvision.transforms.ColorJitter(brightness,contrast,saturation,hue)
     return color_jitter
 
@@ -82,7 +83,6 @@ def sinkhorn_knopp(sims):
         Q = Q*B # the columns must sum to 1 so that Q is an assignment
 
     return Q.t()
-
 
 
 def find_clusters(log_dict, level_embds, prototypes):
