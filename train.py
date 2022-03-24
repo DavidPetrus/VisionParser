@@ -105,10 +105,37 @@ def main(argv):
             optimizer.zero_grad()
 
             train_iter += 1
-            log_dict = {"Epoch":epoch, "Train Iteration":train_iter, "Final Loss": loss, "Num Valid A": features_clust_a.shape[0], "Num Valid B": features_clust_b.shape[0]}
+            log_dict = {"Epoch":epoch, "Train Iteration":train_iter, "Train Loss": loss, \
+                        "Num Valid A": features_clust_a.shape[0], "Num Valid B": features_clust_b.shape[0]}
             
-            if train_iter % 100 == 0:
+            if train_iter % 10 == 0:
                 print(log_dict)
+
+
+        val_iter = 0
+        for frames_load in validation_generator:
+            with torch.no_grad():
+                image_batch = [color_aug(img.to('cuda')) for img in frames_load[0]]
+
+                crop_dims = frames_load[1]
+                image_batch = torch.cat(image_batch, dim=0)
+
+                feature_maps = model.extract_feature_map(image_batch)
+                fm_full,fm_a,fm_b = feature_maps[:FLAGS.batch_size],feature_maps[FLAGS.batch_size:2*FLAGS.batch_size],feature_maps[2*FLAGS.batch_size:]
+
+                max_cluster_mask = model.assign_nearest_clusters(fm_full)
+                features_clust_a, features_clust_b, features_sim_a, features_sim_b = model.spatial_map_cluster_assign([fm_a,fm_b],max_cluster_mask, crop_dims)
+
+                loss_1 = model.swav_loss(features_clust_a, features_sim_b)
+                loss_2 = model.swav_loss(features_clust_b, features_sim_a)
+                loss = loss_1 + loss_2
+
+                val_iter += 1
+                log_dict = {"Epoch":epoch, "Validation Iteration":val_iter, "Val Loss": loss, \
+                            "Val Num Valid A": features_clust_a.shape[0], "Val Num Valid B": features_clust_b.shape[0]}
+                
+                if val_iter % 10 == 0:
+                    print(log_dict)
 
         
 
