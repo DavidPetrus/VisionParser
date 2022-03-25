@@ -84,6 +84,7 @@ def main(argv):
         # Set optimzer gradients to zero
         optimizer.zero_grad()
         for frames_load in training_generator:
+            #with torch.autograd.detect_anomaly():
             image_batch = [color_aug(img.to('cuda')) for img in frames_load[0]]
 
             crop_dims = frames_load[1]
@@ -106,10 +107,12 @@ def main(argv):
 
             train_iter += 1
             log_dict = {"Epoch":epoch, "Train Iteration":train_iter, "Train Loss": loss, \
-                        "Num Valid A": features_clust_a.shape[0], "Num Valid B": features_clust_b.shape[0]}
+                        "Num Valid A": features_clust_a.shape[0]/FLAGS.num_embds_per_cluster, "Num Valid B": features_clust_b.shape[0]/FLAGS.num_embds_per_cluster}
             
             if train_iter % 10 == 0:
                 print(log_dict)
+
+            wandb.log(log_dict)
 
 
         val_iter = 0
@@ -132,10 +135,12 @@ def main(argv):
 
                 val_iter += 1
                 log_dict = {"Epoch":epoch, "Validation Iteration":val_iter, "Val Loss": loss, \
-                            "Val Num Valid A": features_clust_a.shape[0], "Val Num Valid B": features_clust_b.shape[0]}
+                            "Val Num Valid A": features_clust_a.shape[0]/FLAGS.num_embds_per_cluster, "Val Num Valid B": features_clust_b.shape[0]/FLAGS.num_embds_per_cluster}
                 
                 if val_iter % 10 == 0:
                     print(log_dict)
+
+                wandb.log(log_dict)
 
         
 
