@@ -14,7 +14,7 @@ FLAGS = flags.FLAGS
 IMAGENET_DEFAULT_MEAN = (255*0.485, 255*0.456, 255*0.406)
 IMAGENET_DEFAULT_STD = (255*0.229, 255*0.224, 255*0.225)
 
-#color = np.random.randint(0,256,[5120,3],dtype=np.uint8)
+color = np.random.randint(0,256,[5120,3],dtype=np.uint8)
 
 def resize_image(image, max_patch_size):
     height, width, _ = image.shape
@@ -48,7 +48,7 @@ def random_crop(image, crop_dims=None):
     #t_size = (int(c_h*resize_frac),int(c_w*resize_frac))
     #resized = F.interpolate(crop.unsqueeze(0),size=(t_size[0]*8,t_size[1]*8),mode='bilinear',align_corners=True)
 
-    return crop
+    return crop, [crop_x,crop_y,crop_size]
 
 
 def color_distortion(brightness=0.7, contrast=0.7, saturation=0.7, hue=0.15):
@@ -84,54 +84,36 @@ def sinkhorn_knopp(sims):
 
     return Q.t()
 
+def calculate_iou(cluster_mask, annots):
+    # cluster_mask B,num_proto,h/8,w/8
+    # annots B,460,h,w
 
-def find_clusters(log_dict, level_embds, prototypes):
-    l_ix = 0
-    embd_tensor = level_embds
-    embds = embd_tensor.detach().movedim(1,3)
-    _,l_h,l_w,_ = embds.shape
-    embds = embds.reshape(l_h*l_w,-1)
-    embds = F.normalize(embds,dim=1)
-    sims = prototypes(embds)
+    cluster_mask = F.interpolate(cluster_mask,size=(FLAGS.image_size,FLAGS.image_size),mode='nearest')
+    annots = annots
 
-    clust_sims,clusters = sims.max(dim=1)
+    intersection = (cluster_mask.unsqueeze(1) & annots.unsqueeze(2)).sum(3,4) # B,460,num_proto
+    union = (cluster_mask.unsqueeze(1) | annots.unsqueeze(2)).sum(3,4) # B,460,num_proto
 
-    _,clust_counts = torch.unique(clusters, return_counts=True)
-    sorted_counts,_ = torch.sort(clust_counts,descending=True)
-    total_points = sorted_counts.sum()
+    iou = (intersection / (union + 1e-6))
+    iou,_ = iou.max(1) # B,num_protos
 
-    log_dict['n_clusters/mean_sim'] = clust_sims.mean()
-    log_dict['n_clusters/std_sim'] = clust_sims.std()
-    log_dict['n_clusters/num_clusts'] = sorted_counts.shape[0]
-    log_dict['n_clusters/min_freq'] = sorted_counts[-1]/total_points
+    mean_iou = iou[iou > 0.02].mean()
+    num_ious = (iou > 0.02).sum()
 
-    if sorted_counts.shape[0] >= 3:
-        log_dict['n_clusters/1_freq'] = sorted_counts[0]/total_points
-        log_dict['n_clusters/2_freq'] = sorted_counts[1]/total_points
-        log_dict['n_clusters/3_freq'] = sorted_counts[2]/total_points
+    if mean_iou.isnan():
+        return 0.,0.
+    else:
+        return mean_iou, num_ious
 
-    return log_dict
 
-def plot_embeddings(level_embds,prototypes):
+def plot_clusters(sims):
     global color
 
-    resize = [8,8,8,8,16]
-    segs = []
+    clusters = sims.argmax(dim=1)[0].cpu().numpy()
 
-    for l_ix, embd_tensor in enumerate(level_embds):
-        embds = embd_tensor.detach().movedim(1,3)
-        _,l_h,l_w,_ = embds.shape
-        embds = embds.reshape(l_h*l_w,-1)
-
-        embds = F.normalize(embds,dim=1)
-        sims = prototypes(embds)
-        clusters = sims.argmax(dim=1)
-        clusters = clusters.reshape(l_h,l_w).cpu().numpy()
-
-        seg = np.zeros([clusters.shape[0],clusters.shape[1],3],dtype=np.uint8)
-        for c in range(clusters.max()+1):
-            seg[clusters==c] = color[c]
-        seg = cv2.resize(seg, (seg.shape[1]*resize[l_ix],seg.shape[0]*resize[l_ix]))
-        segs.append(seg)
-
-    return segs
+    seg = np.zeros([clusters.shape[0],clusters.shape[1],3],dtype=np.uint8)
+    for c in range(clusters.max()+1):
+        seg[clusters==c] = color[c]
+    
+    seg = cv2.resize(seg, (seg.shape[1]*8,seg.shape[0]*8))
+    return seg
