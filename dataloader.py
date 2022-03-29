@@ -19,6 +19,8 @@ class PascalVOC(torch.utils.data.Dataset):
         self.batch_size = FLAGS.batch_size
         self.load_ann = True
 
+        #cv2.setNumThreads(0)
+
     def __len__(self):
         return len(self.image_files)//self.batch_size
 

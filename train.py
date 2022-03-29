@@ -19,7 +19,7 @@ flags.DEFINE_string('exp','test','')
 flags.DEFINE_string('dataset','pascal','pascal,ade')
 flags.DEFINE_string('root_dir','/home/petrus/','')
 flags.DEFINE_integer('num_workers',0,'')
-flags.DEFINE_integer('batch_size',64,'')
+flags.DEFINE_integer('batch_size',32,'')
 flags.DEFINE_float('lr',0.01,'')
 flags.DEFINE_integer('image_size',256,'')
 flags.DEFINE_integer('embd_dim',512,'')
@@ -140,7 +140,7 @@ def main(argv):
 
             wandb.log(log_dict)
 
-            if train_iter % 300 == 0:
+            if train_iter % 300 == 0 and train_iter <= 600:
                 for g in optimizer.param_groups:
                     g['lr'] /= 10
 
