@@ -18,7 +18,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string('exp','test','')
 flags.DEFINE_string('dataset','pascal','pascal,ade')
 flags.DEFINE_string('root_dir','/home/petrus/','')
-flags.DEFINE_integer('num_workers',0,'')
+flags.DEFINE_integer('num_workers',4,'')
 flags.DEFINE_integer('batch_size',32,'')
 flags.DEFINE_float('lr',0.01,'')
 flags.DEFINE_integer('image_size',256,'')
@@ -38,6 +38,7 @@ flags.DEFINE_bool('round_q',True,'')
 flags.DEFINE_float('epsilon',0.05,'')
 
 flags.DEFINE_float('cl_temp',0.1,'')
+flags.DEFINE_float('intra_clust_coeff',1.,'')
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -59,20 +60,21 @@ def main(argv):
         all_images = glob.glob(FLAGS.root_dir+"ADE20K/images/ADE/training/work_place/*/*.jpg")
         random.seed(7)
         random.shuffle(all_images)
-        train_images = all_images[:-600]
-        val_images = all_images[-600:]
+        train_images = all_images[:-300]
+        val_images = all_images[-300:]
 
         training_set = ADE20k_Dataset(train_images)
         training_generator = torch.utils.data.DataLoader(training_set, batch_size=None, shuffle=True, num_workers=FLAGS.num_workers)
 
         validation_set = ADE20k_Dataset(val_images)
         validation_generator = torch.utils.data.DataLoader(validation_set, batch_size=None, shuffle=True, num_workers=FLAGS.num_workers)
+
     elif FLAGS.dataset == 'pascal':
-        all_images = glob.glob(FLAGS.root_dir+"VOCdevkit/VOC2012/trainval/trainval/*")
+        all_images = glob.glob(FLAGS.root_dir+"VOCdevkit/VOC2012/trainval/trainval/*.mat")
         random.seed(7)
         random.shuffle(all_images)
-        train_images = all_images[:-600]
-        val_images = all_images[-600:]
+        train_images = all_images[:-300]
+        val_images = all_images[-300:]
 
         training_set = PascalVOC(train_images)
         training_generator = torch.utils.data.DataLoader(training_set, batch_size=None, shuffle=True, num_workers=FLAGS.num_workers)
@@ -96,7 +98,7 @@ def main(argv):
     total_loss = 0.
     step_loss = 0.
     train_iter = 0
-    for epoch in range(50):
+    for epoch in range(10):
         model.train()
         # Set optimzer gradients to zero
         optimizer.zero_grad()
@@ -110,37 +112,47 @@ def main(argv):
             feature_maps = model.extract_feature_map(image_batch)
             fm_full,fm_a,fm_b = feature_maps[:FLAGS.batch_size],feature_maps[FLAGS.batch_size:2*FLAGS.batch_size],feature_maps[2*FLAGS.batch_size:]
 
-            max_cluster_mask = model.assign_nearest_clusters(fm_full)
+            max_cluster_mask, sims = model.assign_nearest_clusters(fm_full, ret_sims=True)
             features_clust_a, features_clust_b, features_sim_a, features_sim_b = model.spatial_map_cluster_assign([fm_a,fm_b],max_cluster_mask, crop_dims)
 
             loss_1 = model.swav_loss(features_clust_a, features_sim_b)
             loss_2 = model.swav_loss(features_clust_b, features_sim_a)
             loss = loss_1 + loss_2
 
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.net.parameters(), 10000.)
+            if FLAGS.intra_clust_coeff > 0.:
+                intra_sims = (sims * max_cluster_mask).sum() / max_cluster_mask.sum()
+                intra_loss = 1. - intra_sims
+
+            final_loss = loss + FLAGS.intra_clust_coeff*intra_loss
+
+            final_loss.backward()
+            #grad_norm = torch.nn.utils.clip_grad_norm_(model.net.parameters(), 10000.)
 
             optimizer.step()
             optimizer.zero_grad()
 
-            with torch.no_grad():
-                num_embds_per_cluster = max_cluster_mask.sum((0,2,3))
+            log_dict = {"Epoch":epoch, "Iter":train_iter, "Loss": loss, "Intra Loss": intra_loss, \
+                        "Num A": features_clust_a.shape[0]/FLAGS.num_embds_per_cluster}
 
-                annots = frames_load[2]
-                miou, num_ious = calculate_iou(max_cluster_mask.to('cpu'), annots)
+            if train_iter % 20 == 0:
+                with torch.no_grad():
+                    #num_embds_per_cluster = max_cluster_mask.sum((0,2,3))
 
-            train_iter += 1
-            log_dict = {"Epoch":epoch, "Iter":train_iter, "Loss": loss, "Grad Norm": grad_norm, \
-                        "Num A": features_clust_a.shape[0]/FLAGS.num_embds_per_cluster, \
-                        "MIOU": miou, "Num IOUS": num_ious, \
-                        "C0": num_embds_per_cluster[0], "C1": num_embds_per_cluster[1], "C2": num_embds_per_cluster[2]}
+                    annots = frames_load[2]
+                    miou, num_ious = calculate_iou(max_cluster_mask.to('cpu'), annots)
+
+                    log_dict['MIOU'] = miou
+                    log_dict['Num IOUS'] = num_ious
+
             
+            train_iter += 1
+
             if train_iter % 10 == 0:
                 print(log_dict)
 
             wandb.log(log_dict)
 
-            if train_iter % 300 == 0 and train_iter <= 600:
+            if train_iter % 300 == 0 and train_iter <= 300:
                 for g in optimizer.param_groups:
                     g['lr'] /= 10
 
@@ -181,8 +193,7 @@ def main(argv):
                         "Val MIOU": total_miou/val_iter, "Val Num IOUS": total_num_ious/val_iter, \
                         "Val Num Valid A": features_clust_a.shape[0]/FLAGS.num_embds_per_cluster}
             
-            if val_iter % 10 == 0:
-                print(log_dict)
+            print(log_dict)
 
             wandb.log(log_dict)
 
@@ -192,7 +203,7 @@ def main(argv):
         
 
 if __name__ == '__main__':
-    #torch.multiprocessing.set_start_method('spawn', force=True)
+    torch.multiprocessing.set_start_method('spawn', force=True)
     app.run(main)
 
 

@@ -31,11 +31,11 @@ def normalize_image(image):
     return image/255.
 
 
-def random_crop(image, crop_dims=None):
+def random_crop(image, crop_dims=None, min_crop=None):
     c, img_h, img_w = image.shape
 
     if crop_dims is None:
-        crop_size = np.random.uniform(FLAGS.min_crop,min(img_h/img_w,img_w/img_h))
+        crop_size = np.random.uniform(min_crop,min(img_h/img_w,img_w/img_h))
         crop_size = int(min(img_h,img_w)*crop_size)
         crop_x,crop_y = np.random.randint(0,img_w-crop_size), np.random.randint(0,img_h-crop_size)
     else:
@@ -88,6 +88,7 @@ def calculate_iou(cluster_mask, annots):
     # cluster_mask B,num_proto,h/8,w/8
     # annots B,460,h,w
 
+    annots = F.one_hot(annots.long().squeeze(1), 460).movedim(3,1)
     annots = F.interpolate(annots.float(), size=(int(FLAGS.image_size/8),int(FLAGS.image_size/8)), mode='nearest').bool()
     cluster_mask = cluster_mask.bool()
     annotated_cats = annots.sum((0,2,3)) > 0
