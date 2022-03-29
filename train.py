@@ -69,7 +69,6 @@ def main(argv):
         validation_generator = torch.utils.data.DataLoader(validation_set, batch_size=None, shuffle=True, num_workers=FLAGS.num_workers)
     elif FLAGS.dataset == 'pascal':
         all_images = glob.glob(FLAGS.root_dir+"VOCdevkit/VOC2012/trainval/trainval/*")
-
         random.seed(7)
         random.shuffle(all_images)
         train_images = all_images[:-600]
@@ -127,9 +126,8 @@ def main(argv):
             with torch.no_grad():
                 num_embds_per_cluster = max_cluster_mask.sum((0,2,3))
 
-                annots = frames_load[2].to('cuda')
-                miou, num_ious = calculate_iou(max_cluster_mask, annots)
-
+                annots = frames_load[2]
+                miou, num_ious = calculate_iou(max_cluster_mask.to('cpu'), annots)
 
             train_iter += 1
             log_dict = {"Epoch":epoch, "Iter":train_iter, "Loss": loss, "Grad Norm": grad_norm, \
@@ -172,8 +170,8 @@ def main(argv):
                 val_iter += 1
 
                 with torch.no_grad():
-                    annots = frames_load[2].to('cuda')
-                    miou, num_ious = calculate_iou(max_cluster_mask, annots)
+                    annots = frames_load[2]
+                    miou, num_ious = calculate_iou(max_cluster_mask.to('cpu'), annots)
                     total_miou += miou
                     total_num_ious += num_ious
 

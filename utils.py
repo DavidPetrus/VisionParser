@@ -88,11 +88,13 @@ def calculate_iou(cluster_mask, annots):
     # cluster_mask B,num_proto,h/8,w/8
     # annots B,460,h,w
 
-    cluster_mask = F.interpolate(cluster_mask,size=(FLAGS.image_size,FLAGS.image_size),mode='nearest')
-    annots = annots
-
-    intersection = (cluster_mask.unsqueeze(1) & annots.unsqueeze(2)).sum(3,4) # B,460,num_proto
-    union = (cluster_mask.unsqueeze(1) | annots.unsqueeze(2)).sum(3,4) # B,460,num_proto
+    annots = F.interpolate(annots.float(), size=(int(FLAGS.image_size/8),int(FLAGS.image_size/8)), mode='nearest').bool()
+    cluster_mask = cluster_mask.bool()
+    annotated_cats = annots.sum((0,2,3)) > 0
+    max_clusters =  cluster_mask.sum((0,2,3)) > 0
+    
+    intersection = (cluster_mask[:8,max_clusters].unsqueeze(1) & annots[:8, annotated_cats].unsqueeze(2)).sum((3,4)) # B,460,num_proto
+    union = (cluster_mask[:8,max_clusters].unsqueeze(1) | annots[:8, annotated_cats].unsqueeze(2)).sum((3,4)) # B,460,num_proto
 
     iou = (intersection / (union + 1e-6))
     iou,_ = iou.max(1) # B,num_protos
@@ -103,7 +105,7 @@ def calculate_iou(cluster_mask, annots):
     if mean_iou.isnan():
         return 0.,0.
     else:
-        return mean_iou, num_ious
+        return mean_iou, num_ious / 8
 
 
 def plot_clusters(sims):

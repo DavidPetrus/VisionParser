@@ -84,10 +84,12 @@ class VisionParser(nn.Module):
                                  round(overlap_dims[0]*masks.shape[3]):round(overlap_dims[2]*masks.shape[3])]
         
         resized_mask_a = F.interpolate(cropped_mask, size=(fm_a_crop.shape[2],fm_a_crop.shape[3]),mode='bilinear',align_corners=False)
-        resized_mask_a = torch.where(resized_mask_a > FLAGS.assign_thresh, 1., 0.) # B,num_protos,fm_a_h,fm_a_w
+        if FLAGS.assign_thresh > 0.:
+            resized_mask_a = torch.where(resized_mask_a > FLAGS.assign_thresh, 1., 0.) # B,num_protos,fm_a_h,fm_a_w
 
         resized_mask_b = F.interpolate(cropped_mask, size=(fm_b_crop.shape[2],fm_b_crop.shape[3]),mode='bilinear',align_corners=False)
-        resized_mask_b = torch.where(resized_mask_b > FLAGS.assign_thresh, 1., 0.) # B,num_protos,fm_b_h,fm_b_w
+        if FLAGS.assign_thresh > 0.:
+            resized_mask_b = torch.where(resized_mask_b > FLAGS.assign_thresh, 1., 0.) # B,num_protos,fm_b_h,fm_b_w
 
         mask_a_count = resized_mask_a.sum(dim=(2,3)) # B,num_protos
         mask_b_count = resized_mask_b.sum(dim=(2,3)) # B,num_protos
