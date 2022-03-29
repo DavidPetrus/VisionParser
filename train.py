@@ -38,7 +38,7 @@ flags.DEFINE_bool('round_q',True,'')
 flags.DEFINE_float('epsilon',0.05,'')
 
 flags.DEFINE_float('cl_temp',0.1,'')
-flags.DEFINE_float('intra_clust_coeff',1.,'')
+flags.DEFINE_float('intra_clust_coeff',0.,'')
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -113,10 +113,10 @@ def main(argv):
             fm_full,fm_a,fm_b = feature_maps[:FLAGS.batch_size],feature_maps[FLAGS.batch_size:2*FLAGS.batch_size],feature_maps[2*FLAGS.batch_size:]
 
             max_cluster_mask, sims = model.assign_nearest_clusters(fm_full, ret_sims=True)
-            features_clust_a, features_clust_b, features_sim_a, features_sim_b = model.spatial_map_cluster_assign([fm_a,fm_b],max_cluster_mask, crop_dims)
+            features_clust_a, features_clust_b, features_sim_a, features_sim_b, valid_a, valid_b = model.spatial_map_cluster_assign([fm_a,fm_b],max_cluster_mask, crop_dims)
 
-            loss_1 = model.swav_loss(features_clust_a, features_sim_b)
-            loss_2 = model.swav_loss(features_clust_b, features_sim_a)
+            loss_1 = model.swav_loss(features_clust_a, features_sim_b, valid_a)
+            loss_2 = model.swav_loss(features_clust_b, features_sim_a, valid_b)
             loss = loss_1 + loss_2
 
             if FLAGS.intra_clust_coeff > 0.:

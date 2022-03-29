@@ -13,14 +13,14 @@ from absl import flags, app
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string('weights','test','')
-flags.DEFINE_string('root_dir','/home/petrus/ADE20K/images/','')
+flags.DEFINE_string('root_dir','/home/petrus/','')
 flags.DEFINE_integer('num_prototypes',100,'')
 flags.DEFINE_integer('embd_dim',512,'')
 
 
 def main(argv):
 
-    all_images = glob.glob(FLAGS.root_dir+"ADE/training/work_place/*/*.jpg")
+    all_images = glob.glob(FLAGS.root_dir+"VOCdevkit/VOC2012/JPEGImages/*")
     random.shuffle(all_images)
 
     model = VisionParser()
@@ -36,14 +36,15 @@ def main(argv):
         img = img.movedim(2,0)
         img = normalize_image(img).unsqueeze(0).to('cuda')
 
-        print(img.shape)
         feature_map = model.extract_feature_map(img)
-        sims = model.assign_nearest_clusters(feature_map, ret_sims=True)
+        _,sims = model.assign_nearest_clusters(feature_map, ret_sims=True)
         seg_map = plot_clusters(sims)
 
         cv2.imshow('a', seg_map)
         cv2.imshow('b', img_cv[:,:,::-1])
-        cv2.waitKey(0)
+        key = cv2.waitKey(0)
+        if key == ord('q'):
+            break
 
 
 

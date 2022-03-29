@@ -32,15 +32,15 @@ class VisionParser(nn.Module):
             w = F.normalize(w, dim=1, p=2)
             self.prototypes.weight.copy_(w)
 
-    def swav_loss(self, clust_features, sim_features):
+    def swav_loss(self, clust_features, sim_features, valid_clusters):
         if clust_features.shape[0] < FLAGS.min_valid_clusts:
             return 0.
 
         clust_features = F.normalize(clust_features, dim=1)
         sim_features = F.normalize(sim_features, dim=1)
 
-        clust_sims = self.prototypes(clust_features)
-        feat_sims = self.prototypes(sim_features)
+        clust_sims = self.prototypes(clust_features)[:,valid_clusters]
+        feat_sims = self.prototypes(sim_features)[:,valid_clusters]
 
         with torch.set_grad_enabled(not FLAGS.sg_cluster_assign):
             q = sinkhorn_knopp(clust_sims)
@@ -60,7 +60,7 @@ class VisionParser(nn.Module):
         mask = F.one_hot(nearest_cluster, FLAGS.num_prototypes).movedim(3,1) # B,num_prototypes,img_size/8,img_size/8
 
         if ret_sims:
-            return sims
+            return mask.float(), sims
         else:
             return mask.float()
 
@@ -119,7 +119,8 @@ class VisionParser(nn.Module):
 
 
         return features_clust_a.reshape(-1,FLAGS.embd_dim), features_clust_b.reshape(-1,FLAGS.embd_dim), \
-               features_sim_a.reshape(-1,FLAGS.embd_dim), features_sim_b.reshape(-1,FLAGS.embd_dim)
+               features_sim_a.reshape(-1,FLAGS.embd_dim), features_sim_b.reshape(-1,FLAGS.embd_dim), \
+               valid_protos_a, valid_protos_b
 
     def extract_feature_map(self, images):
         return self.net(images)[0]
