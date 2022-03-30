@@ -7,7 +7,7 @@ import random
 
 from vision_parser import VisionParser
 from dataloader import ADE20k_Dataset, PascalVOC
-from utils import color_distortion, calculate_iou
+from utils import color_distortion, calculate_iou, vic_reg
 
 import wandb
 
@@ -19,7 +19,7 @@ flags.DEFINE_string('exp','test','')
 flags.DEFINE_string('dataset','pascal','pascal,ade')
 flags.DEFINE_string('root_dir','/home/petrus/','')
 flags.DEFINE_integer('num_workers',4,'')
-flags.DEFINE_integer('batch_size',32,'')
+flags.DEFINE_integer('batch_size',48,'')
 flags.DEFINE_float('lr',0.01,'')
 flags.DEFINE_integer('image_size',256,'')
 flags.DEFINE_integer('embd_dim',512,'')
@@ -28,17 +28,20 @@ flags.DEFINE_float('min_crop',0.55,'')
 flags.DEFINE_float('max_crop',0.75,'')
 flags.DEFINE_float('assign_thresh',0.7,'')
 
-flags.DEFINE_integer('num_prototypes',100,'')
+flags.DEFINE_integer('num_prototypes',40,'')
 flags.DEFINE_integer('min_per_img_embds',5,'')
 flags.DEFINE_integer('num_embds_per_cluster',5,'')
-flags.DEFINE_integer('min_valid_clusts',5,'')
+flags.DEFINE_integer('min_valid_clusts',3,'')
+flags.DEFINE_float('min_sim',0.2,'')
 flags.DEFINE_bool('sg_cluster_assign',True,'')
 flags.DEFINE_integer('sinkhorn_iters',3,'')
 flags.DEFINE_bool('round_q',True,'')
 flags.DEFINE_float('epsilon',0.05,'')
 
 flags.DEFINE_float('cl_temp',0.1,'')
-flags.DEFINE_float('intra_clust_coeff',0.,'')
+
+flags.DEFINE_float('std_coeff',1.,'')
+flags.DEFINE_float('cov_coeff',0.04,'')
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -92,13 +95,15 @@ def main(argv):
     optimizer = torch.optim.Adam(model.net.parameters(), lr=FLAGS.lr)
 
     model.to('cuda')
+
+    zero = torch.tensor(0., dtype=torch.float32).to('cuda')
    
     print((datetime.datetime.now()-start).total_seconds())
     min_loss = 100.
     total_loss = 0.
     step_loss = 0.
     train_iter = 0
-    for epoch in range(10):
+    for epoch in range(5):
         model.train()
         # Set optimzer gradients to zero
         optimizer.zero_grad()
@@ -113,17 +118,16 @@ def main(argv):
             fm_full,fm_a,fm_b = feature_maps[:FLAGS.batch_size],feature_maps[FLAGS.batch_size:2*FLAGS.batch_size],feature_maps[2*FLAGS.batch_size:]
 
             max_cluster_mask, sims = model.assign_nearest_clusters(fm_full, ret_sims=True)
-            features_clust_a, features_clust_b, features_sim_a, features_sim_b, valid_a, valid_b = model.spatial_map_cluster_assign([fm_a,fm_b],max_cluster_mask, crop_dims)
+            features_clust_a, features_clust_b, features_sim_a, features_sim_b, valid_a, valid_b, num_samples_a = model.spatial_map_cluster_assign(
+                                                                                                            [fm_a,fm_b], max_cluster_mask, crop_dims)
+
+            std_loss, cov_loss = vic_reg(features_clust_a)
 
             loss_1 = model.swav_loss(features_clust_a, features_sim_b, valid_a)
             loss_2 = model.swav_loss(features_clust_b, features_sim_a, valid_b)
             loss = loss_1 + loss_2
 
-            if FLAGS.intra_clust_coeff > 0.:
-                intra_sims = (sims * max_cluster_mask).sum() / max_cluster_mask.sum()
-                intra_loss = 1. - intra_sims
-
-            final_loss = loss + FLAGS.intra_clust_coeff*intra_loss
+            final_loss = loss + FLAGS.std_coeff*std_loss + FLAGS.cov_coeff*cov_loss
 
             final_loss.backward()
             #grad_norm = torch.nn.utils.clip_grad_norm_(model.net.parameters(), 10000.)
@@ -131,8 +135,8 @@ def main(argv):
             optimizer.step()
             optimizer.zero_grad()
 
-            log_dict = {"Epoch":epoch, "Iter":train_iter, "Loss": loss, "Intra Loss": intra_loss, \
-                        "Num A": features_clust_a.shape[0]/FLAGS.num_embds_per_cluster}
+            log_dict = {"Epoch":epoch, "Iter":train_iter, "Loss": loss, "Std Loss": std_loss, "Cov Loss": cov_loss, \
+                        "Num A": features_clust_a.shape[0]/num_samples_a, "Num Samples": num_samples_a}
 
             if train_iter % 20 == 0:
                 with torch.no_grad():
@@ -152,7 +156,7 @@ def main(argv):
 
             wandb.log(log_dict)
 
-            if train_iter % 300 == 0 and train_iter <= 300:
+            if train_iter == 300 or train_iter == 800:
                 for g in optimizer.param_groups:
                     g['lr'] /= 10
 
@@ -172,10 +176,11 @@ def main(argv):
                 fm_full,fm_a,fm_b = feature_maps[:FLAGS.batch_size],feature_maps[FLAGS.batch_size:2*FLAGS.batch_size],feature_maps[2*FLAGS.batch_size:]
 
                 max_cluster_mask = model.assign_nearest_clusters(fm_full)
-                features_clust_a, features_clust_b, features_sim_a, features_sim_b = model.spatial_map_cluster_assign([fm_a,fm_b],max_cluster_mask, crop_dims)
+                features_clust_a, features_clust_b, features_sim_a, features_sim_b, valid_a, valid_b,_ = model.spatial_map_cluster_assign(
+                                                                                                [fm_a,fm_b], max_cluster_mask, crop_dims)
 
-                loss_1 = model.swav_loss(features_clust_a, features_sim_b)
-                loss_2 = model.swav_loss(features_clust_b, features_sim_a)
+                loss_1 = model.swav_loss(features_clust_a, features_sim_b, valid_a)
+                loss_2 = model.swav_loss(features_clust_b, features_sim_a, valid_b)
                 loss = loss_1 + loss_2
 
                 total_val_loss += loss
@@ -190,8 +195,7 @@ def main(argv):
 
             avg_val_loss = total_val_loss/val_iter
             log_dict = {"Epoch":epoch, "Val Loss": avg_val_loss, \
-                        "Val MIOU": total_miou/val_iter, "Val Num IOUS": total_num_ious/val_iter, \
-                        "Val Num Valid A": features_clust_a.shape[0]/FLAGS.num_embds_per_cluster}
+                        "Val MIOU": total_miou/val_iter, "Val Num IOUS": total_num_ious/val_iter}
             
             print(log_dict)
 

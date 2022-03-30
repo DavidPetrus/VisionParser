@@ -8,8 +8,6 @@ import cv2
 
 from utils import sinkhorn_knopp
 
-import warnings
-
 from absl import flags
 
 FLAGS = flags.FLAGS
@@ -20,7 +18,7 @@ class VisionParser(nn.Module):
     def __init__(self):
         super(VisionParser, self).__init__()
 
-        self.net = timm.create_model('resnest26d',features_only=True,pretrained=False,out_indices=(2,))
+        self.net = timm.create_model('resnest26d', features_only=True, pretrained=False, out_indices=(2,))
 
         self.prototypes = nn.Linear(FLAGS.embd_dim, FLAGS.num_prototypes, bias=False)
         self.normalize_prototypes()
@@ -84,21 +82,23 @@ class VisionParser(nn.Module):
                                  round(overlap_dims[0]*masks.shape[3]):round(overlap_dims[2]*masks.shape[3])]
         
         resized_mask_a = F.interpolate(cropped_mask, size=(fm_a_crop.shape[2],fm_a_crop.shape[3]),mode='bilinear',align_corners=False)
-        if FLAGS.assign_thresh > 0.:
-            resized_mask_a = torch.where(resized_mask_a > FLAGS.assign_thresh, 1., 0.) # B,num_protos,fm_a_h,fm_a_w
+        #if FLAGS.assign_thresh > 0.:
+        #    resized_mask_a = torch.where(resized_mask_a > FLAGS.assign_thresh, 1., 0.) # B,num_protos,fm_a_h,fm_a_w
 
         resized_mask_b = F.interpolate(cropped_mask, size=(fm_b_crop.shape[2],fm_b_crop.shape[3]),mode='bilinear',align_corners=False)
-        if FLAGS.assign_thresh > 0.:
-            resized_mask_b = torch.where(resized_mask_b > FLAGS.assign_thresh, 1., 0.) # B,num_protos,fm_b_h,fm_b_w
+        #if FLAGS.assign_thresh > 0.:
+        #    resized_mask_b = torch.where(resized_mask_b > FLAGS.assign_thresh, 1., 0.) # B,num_protos,fm_b_h,fm_b_w
 
         mask_a_count = resized_mask_a.sum(dim=(2,3)) # B,num_protos
         mask_b_count = resized_mask_b.sum(dim=(2,3)) # B,num_protos
 
-        valid_protos_a = (mask_a_count >= FLAGS.min_per_img_embds).sum(0) >= FLAGS.num_embds_per_cluster # num_protos
+        num_valid_embds = (mask_a_count >= FLAGS.min_per_img_embds).sum(0)
+        valid_protos_a = num_valid_embds >= FLAGS.num_embds_per_cluster # num_protos
+        num_samples_a = num_valid_embds[valid_protos_a].min()
         proto_features_a = fm_a_crop.unsqueeze(1) * resized_mask_a[:,valid_protos_a].unsqueeze(2) # B,num_valid_a,c,fm_a_h,fm_a_w
         proto_features_a = proto_features_a.sum(dim=(3,4)) / (mask_a_count[:,valid_protos_a].unsqueeze(2) + 1e-6) # B,num_valid_a,c
         sampled_indices_a = torch.multinomial((mask_a_count >= FLAGS.min_per_img_embds)[:,valid_protos_a].movedim(0,1).float(), \
-                                              FLAGS.num_embds_per_cluster).unsqueeze(2).tile(1,1,FLAGS.embd_dim) # num_valid_a,num_embds_per_clust,c
+                                              num_samples_a).unsqueeze(2).tile(1,1,FLAGS.embd_dim) # num_valid_a,num_embds_per_clust,c
         features_clust_a = torch.gather(proto_features_a.movedim(0,1),1,sampled_indices_a) # num_valid_a,num_embds_per_clust,c
         
         sim_features_b = fm_b_crop.unsqueeze(1) * resized_mask_b[:,valid_protos_a].unsqueeze(2) # B,num_valid_a,c,fm_a_h,fm_a_w
@@ -106,11 +106,13 @@ class VisionParser(nn.Module):
         features_sim_b = torch.gather(sim_features_b.movedim(0,1),1,sampled_indices_a) # num_valid_a,num_embds_per_clust,c
 
         
-        valid_protos_b = (mask_b_count >= FLAGS.min_per_img_embds).sum(0) >= FLAGS.num_embds_per_cluster # num_protos
+        num_valid_embds = (mask_b_count >= FLAGS.min_per_img_embds).sum(0)
+        valid_protos_b = num_valid_embds >= FLAGS.num_embds_per_cluster # num_protos
+        num_samples_b = num_valid_embds[valid_protos_b].min()
         proto_features_b = fm_b_crop.unsqueeze(1) * resized_mask_b[:,valid_protos_b].unsqueeze(2) # B,num_valid_b,c,fm_b_h,fm_b_w
         proto_features_b = proto_features_b.sum(dim=(3,4)) / (mask_b_count[:,valid_protos_b].unsqueeze(2) + 1e-6) # B,num_valid_b,c
         sampled_indices_b = torch.multinomial((mask_b_count >= FLAGS.min_per_img_embds)[:,valid_protos_b].movedim(0,1).float(), \
-                                              FLAGS.num_embds_per_cluster).unsqueeze(2).tile(1,1,FLAGS.embd_dim) # num_valid_b,num_embds_per_clust,c
+                                              num_samples_b).unsqueeze(2).tile(1,1,FLAGS.embd_dim) # num_valid_b,num_embds_per_clust,c
         features_clust_b = torch.gather(proto_features_b.movedim(0,1),1,sampled_indices_b) # num_valid_b,num_embds_per_clust,c
         
         sim_features_a = fm_a_crop.unsqueeze(1) * resized_mask_a[:,valid_protos_b].unsqueeze(2) # B,num_valid_b,c,fm_a_h,fm_a_w
@@ -120,7 +122,7 @@ class VisionParser(nn.Module):
 
         return features_clust_a.reshape(-1,FLAGS.embd_dim), features_clust_b.reshape(-1,FLAGS.embd_dim), \
                features_sim_a.reshape(-1,FLAGS.embd_dim), features_sim_b.reshape(-1,FLAGS.embd_dim), \
-               valid_protos_a, valid_protos_b
+               valid_protos_a, valid_protos_b, num_samples_a
 
     def extract_feature_map(self, images):
         return self.net(images)[0]

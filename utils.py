@@ -49,9 +49,26 @@ def random_crop(image, crop_dims=None, min_crop=None):
     #resized = F.interpolate(crop.unsqueeze(0),size=(t_size[0]*8,t_size[1]*8),mode='bilinear',align_corners=True)
 
     return crop, [crop_x,crop_y,crop_size]
+    
+
+def vic_reg(x):
+    x = x - x.mean(dim=0)
+    std_x = torch.sqrt(x.var(dim=0) + 0.0001)
+    std_loss = torch.mean(F.relu(1 - std_x))
+
+    cov_x = (x.T @ x) / (x.shape[0] - 1)
+    cov_loss = off_diagonal(cov_x).pow_(2).sum().div(FLAGS.embd_dim)
+
+    return std_loss, cov_loss
 
 
-def color_distortion(brightness=0.7, contrast=0.7, saturation=0.7, hue=0.15):
+def off_diagonal(x):
+    n, m = x.shape
+    assert n == m
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+
+def color_distortion(brightness=0.8, contrast=0.8, saturation=0.8, hue=0.25):
     color_jitter = torchvision.transforms.ColorJitter(brightness,contrast,saturation,hue)
     return color_jitter
 
