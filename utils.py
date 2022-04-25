@@ -55,7 +55,7 @@ def k_means(x, K, Niter=20):
     N = x.shape[0]
     x = F.normalize(x)
     step = int(N/K)
-    c = x[step::step, :][:step].clone()  # (K,D) Simplistic initialization for the centroids
+    c = x[step::step, :][:K].clone()  # (K,D) Simplistic initialization for the centroids
     assert c.shape[0] == K
 
     x_i = LazyTensor(x.view(N, 1, FLAGS.embd_dim))  # (N, 1, D) samples
@@ -81,17 +81,17 @@ def k_means(x, K, Niter=20):
 
         # Add criteria to break
 
-    ce, num_points = concentration_estimation(D_ij)
+    ce, num_points = concentration_estimation(D_ij,cl)
 
     return cl, c, ce, num_points
 
 
-def concentration_estimation(dists):
-    centroid_dists,cl = dists.min(dim=1) # (N,)
+def concentration_estimation(dists,cl):
+    centroid_dists = dists.min(dim=1)[:,0] # (N,)
     num_points_per_clust = torch.bincount(cl) # (K,)
     assert num_points_per_clust.shape[0] == dists.shape[1]
     centroid_dists = centroid_dists**0.5
-    avg_dist = torch.scatter_add(torch.zeros(dists.shape[1]), 0, cl, centroid_dists) / num_points_per_clust
+    avg_dist = torch.scatter_add(torch.zeros(dists.shape[1]).to('cuda'), 0, cl, centroid_dists) / num_points_per_clust
     ce = avg_dist / (num_points_per_clust * torch.log(num_points_per_clust + 10))
 
     return ce, num_points_per_clust
@@ -116,7 +116,7 @@ def off_diagonal(x):
     return x.reshape(b,-1)[:,:-1].reshape(b, n - 1, n + 1)[:,:,1:].reshape(b,-1)
 
 
-def color_distortion(brightness=0.8, contrast=0.8, saturation=0.8, hue=0.25):
+def color_distortion(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1):
     color_jitter = torchvision.transforms.ColorJitter(brightness,contrast,saturation,hue)
     return color_jitter
 
