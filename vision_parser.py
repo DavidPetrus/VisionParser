@@ -20,13 +20,14 @@ class VisionParser(nn.Module):
 
         self.net = timm.create_model('resnest26d', features_only=True, pretrained=False, out_indices=(2,))
 
-        self.prototypes = nn.Linear(FLAGS.embd_dim, FLAGS.num_prototypes, bias=False)
-        self.normalize_prototypes()
+        #self.prototypes = nn.Linear(FLAGS.embd_dim, FLAGS.num_prototypes, bias=False)
+        #self.initialize_and_normalize_prototypes()
+        self.prototypes = torch.randn(1, FLAGS.num_prototypes, FLAGS.embd_dim).to('cuda')
 
-    def normalize_prototypes(self):
+    def initialize_and_normalize_prototypes(self):
         #with torch.set_grad_enabled(not FLAGS.sg_cluster_assign):
         with torch.set_grad_enabled(False):
-            w = self.prototypes.weight.data.clone()
+            w = torch.randn(FLAGS.num_prototypes, FLAGS.embd_dim)
             w = F.normalize(w, dim=1, p=2)
             self.prototypes.weight.copy_(w)
 
@@ -47,20 +48,20 @@ class VisionParser(nn.Module):
 
         return loss
 
-    def assign_nearest_clusters(self, feature_maps, ret_sims=False):
+    def assign_nearest_clusters(self, feature_maps):
         bs,c,h,w = feature_maps.shape
-        feature_maps = F.normalize(feature_maps, dim=1) # B,FLAGS.embd_dim,img_size/8,img_size/8
-        features_flat = feature_maps.movedim(1,3).reshape(-1,FLAGS.embd_dim)
-        sims = self.prototypes(features_flat)
+        features_flat = feature_maps.movedim(1,3).reshape(-1,1,FLAGS.embd_dim)
+
+        #sims = F.softmax(((features_flat - self.prototypes)**2).sum(dim=1)/FLAGS.assign_temp, dim=1) # B*h*w,num_prototypes
+        sims = F.softmax(-torch.cdist(features_flat,self.prototypes).squeeze(1)/FLAGS.assign_temp, dim=1) # num_embds, num_prototypes
+        
         sims = sims.reshape(bs, h, w, FLAGS.num_prototypes).movedim(3,1) # B,num_prototypes,img_size/8,img_size/8
 
         nearest_cluster = sims.argmax(dim=1) # B,img_size/8,img_size/8
         mask = F.one_hot(nearest_cluster, FLAGS.num_prototypes).movedim(3,1) # B,num_prototypes,img_size/8,img_size/8
+        mask = (mask.sum((2,3)) > 3).sum()
 
-        if ret_sims:
-            return mask.float(), sims
-        else:
-            return mask.float()
+        return sims, mask/FLAGS.batch_size
 
     def spatial_map_cluster_assign(self, feature_maps, masks, crop_dims):
         overlap_dims = (max(crop_dims[0][0],crop_dims[1][0]), max(crop_dims[0][1],crop_dims[1][1]), \
@@ -92,7 +93,8 @@ class VisionParser(nn.Module):
         mask_a_count = resized_mask_a.sum(dim=(2,3)) # B,num_protos
         mask_b_count = resized_mask_b.sum(dim=(2,3)) # B,num_protos
 
-        num_valid_embds = (mask_a_count >= FLAGS.min_per_img_embds).sum(0)
+
+        '''num_valid_embds = (mask_a_count >= FLAGS.min_per_img_embds).sum(0)
         valid_protos_a = num_valid_embds >= FLAGS.num_embds_per_cluster # num_protos
         num_samples_a = num_valid_embds[valid_protos_a].min()
         proto_features_a = fm_a_crop.unsqueeze(1) * resized_mask_a[:,valid_protos_a].unsqueeze(2) # B,num_valid_a,c,fm_a_h,fm_a_w
@@ -122,7 +124,24 @@ class VisionParser(nn.Module):
 
         return features_clust_a.reshape(-1,FLAGS.embd_dim), features_clust_b.reshape(-1,FLAGS.embd_dim), \
                features_sim_a.reshape(-1,FLAGS.embd_dim), features_sim_b.reshape(-1,FLAGS.embd_dim), \
-               valid_protos_a, valid_protos_b, num_samples_a
+               valid_protos_a, valid_protos_b, num_samples_a'''
+
+        return fm_a_crop, fm_b_crop, resized_mask_a, resized_mask_b
+
+    def loss_calc(self, features, codes):
+        features = features.movedim(1,3).reshape(-1,1,FLAGS.embd_dim)
+
+        codes = codes.movedim(1,3).reshape(-1,FLAGS.num_prototypes) # num_embds, num_prototypes
+
+        #clust_sims = ((features - self.prototypes)**2).sum(dim=1) # num_embds, num_prototypes
+        clust_sims = -torch.cdist(features,self.prototypes).squeeze(1) # num_embds, num_prototypes
+
+        clust_max = clust_sims.max(dim=1)[0].mean()
+
+        loss = -(codes * F.log_softmax(clust_sims/FLAGS.crop_temp,dim=1)).sum(dim=1).mean()
+
+        return loss, clust_max
+
 
     def extract_feature_map(self, images):
         return self.net(images)[0]

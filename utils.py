@@ -52,20 +52,22 @@ def random_crop(image, crop_dims=None, min_crop=None):
     
 
 def vic_reg(x):
-    x = x - x.mean(dim=0)
-    std_x = torch.sqrt(x.var(dim=0) + 0.0001)
+
+    x = x.movedim(1,3).reshape(FLAGS.batch_size,-1,FLAGS.embd_dim)
+    x = x - x.mean(dim=1, keepdim=True)
+    std_x = torch.sqrt(x.var(dim=1) + 0.0001)
     std_loss = torch.mean(F.relu(1 - std_x))
 
-    cov_x = (x.T @ x) / (x.shape[0] - 1)
-    cov_loss = off_diagonal(cov_x).pow_(2).sum().div(FLAGS.embd_dim)
+    cov_x = torch.matmul(x.movedim(1,2),x) / (x.shape[1] - 1)
+    cov_loss = off_diagonal(cov_x).pow_(2).sum().div(FLAGS.batch_size*FLAGS.embd_dim)
 
     return std_loss, cov_loss
 
 
 def off_diagonal(x):
-    n, m = x.shape
+    b, n, m = x.shape
     assert n == m
-    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+    return x.reshape(b,-1)[:,:-1].reshape(b, n - 1, n + 1)[:,:,1:].reshape(b,-1)
 
 
 def color_distortion(brightness=0.8, contrast=0.8, saturation=0.8, hue=0.25):
@@ -93,11 +95,14 @@ def sinkhorn_knopp(sims):
         Q = Q/B
 
     if FLAGS.round_q:
+        # Verify this is correct
         max_proto_sim,_ = Q.max(dim=0)
         Q[Q != max_proto_sim] = 0.
         Q[Q == max_proto_sim] = 1.
     else:
         Q = Q*B # the columns must sum to 1 so that Q is an assignment
+
+    print(Q)
 
     return Q.t()
 

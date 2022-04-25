@@ -28,7 +28,7 @@ flags.DEFINE_float('min_crop',0.55,'')
 flags.DEFINE_float('max_crop',0.75,'')
 flags.DEFINE_float('assign_thresh',0.7,'')
 
-flags.DEFINE_integer('num_prototypes',40,'')
+flags.DEFINE_integer('num_prototypes',20,'')
 flags.DEFINE_integer('min_per_img_embds',5,'')
 flags.DEFINE_integer('num_embds_per_cluster',5,'')
 flags.DEFINE_integer('min_valid_clusts',3,'')
@@ -38,10 +38,11 @@ flags.DEFINE_integer('sinkhorn_iters',3,'')
 flags.DEFINE_bool('round_q',True,'')
 flags.DEFINE_float('epsilon',0.05,'')
 
-flags.DEFINE_float('cl_temp',0.1,'')
+flags.DEFINE_float('assign_temp',1.,'')
+flags.DEFINE_float('crop_temp',5.,'')
 
-flags.DEFINE_float('std_coeff',1.,'')
-flags.DEFINE_float('cov_coeff',0.04,'')
+flags.DEFINE_float('std_coeff',10.,'')
+flags.DEFINE_float('cov_coeff',10.,'')
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -117,15 +118,15 @@ def main(argv):
             feature_maps = model.extract_feature_map(image_batch)
             fm_full,fm_a,fm_b = feature_maps[:FLAGS.batch_size],feature_maps[FLAGS.batch_size:2*FLAGS.batch_size],feature_maps[2*FLAGS.batch_size:]
 
-            max_cluster_mask, sims = model.assign_nearest_clusters(fm_full, ret_sims=True)
-            features_clust_a, features_clust_b, features_sim_a, features_sim_b, valid_a, valid_b, num_samples_a = model.spatial_map_cluster_assign(
-                                                                                                            [fm_a,fm_b], max_cluster_mask, crop_dims)
+            assign_sims,num_clusts = model.assign_nearest_clusters(fm_full)
+            sim_magn = assign_sims.max(dim=1)[0].mean()
+            features_a, features_b, codes_a, codes_b = model.spatial_map_cluster_assign([fm_a,fm_b], assign_sims, crop_dims)
 
-            std_loss, cov_loss = vic_reg(features_clust_a)
-
-            loss_1 = model.swav_loss(features_clust_a, features_sim_b, valid_a)
-            loss_2 = model.swav_loss(features_clust_b, features_sim_a, valid_b)
+            loss_1,crop_magn = model.loss_calc(features_a, codes_a)
+            loss_2,_ = model.loss_calc(features_b, codes_b)
             loss = loss_1 + loss_2
+
+            std_loss, cov_loss = vic_reg(fm_full)
 
             final_loss = loss + FLAGS.std_coeff*std_loss + FLAGS.cov_coeff*cov_loss
 
@@ -136,9 +137,10 @@ def main(argv):
             optimizer.zero_grad()
 
             log_dict = {"Epoch":epoch, "Iter":train_iter, "Loss": loss, "Std Loss": std_loss, "Cov Loss": cov_loss, \
-                        "Num A": features_clust_a.shape[0]/num_samples_a, "Num Samples": num_samples_a}
+                        "Num Clusts Per Image": num_clusts, \
+                        "Assign Magnitude": sim_magn, "Crop Magnitude": crop_magn}
 
-            if train_iter % 20 == 0:
+            '''if train_iter % 20 == 0:
                 with torch.no_grad():
                     #num_embds_per_cluster = max_cluster_mask.sum((0,2,3))
 
@@ -146,12 +148,12 @@ def main(argv):
                     miou, num_ious = calculate_iou(max_cluster_mask.to('cpu'), annots)
 
                     log_dict['MIOU'] = miou
-                    log_dict['Num IOUS'] = num_ious
+                    log_dict['Num IOUS'] = num_ious'''
 
             
             train_iter += 1
 
-            if train_iter % 10 == 0:
+            if train_iter % 10 == 0 or train_iter < 20:
                 print(log_dict)
 
             wandb.log(log_dict)
@@ -175,22 +177,21 @@ def main(argv):
                 feature_maps = model.extract_feature_map(image_batch)
                 fm_full,fm_a,fm_b = feature_maps[:FLAGS.batch_size],feature_maps[FLAGS.batch_size:2*FLAGS.batch_size],feature_maps[2*FLAGS.batch_size:]
 
-                max_cluster_mask = model.assign_nearest_clusters(fm_full)
-                features_clust_a, features_clust_b, features_sim_a, features_sim_b, valid_a, valid_b,_ = model.spatial_map_cluster_assign(
-                                                                                                [fm_a,fm_b], max_cluster_mask, crop_dims)
+                assign_sims,num_clusts = model.assign_nearest_clusters(fm_full)
+                features_a, features_b, codes_a, codes_b = model.spatial_map_cluster_assign([fm_a,fm_b], assign_sims, crop_dims)
 
-                loss_1 = model.swav_loss(features_clust_a, features_sim_b, valid_a)
-                loss_2 = model.swav_loss(features_clust_b, features_sim_a, valid_b)
+                loss_1,_ = model.loss_calc(features_a, codes_a)
+                loss_2,_ = model.loss_calc(features_b, codes_b)
                 loss = loss_1 + loss_2
 
                 total_val_loss += loss
                 val_iter += 1
 
-                with torch.no_grad():
+                '''with torch.no_grad():
                     annots = frames_load[2]
                     miou, num_ious = calculate_iou(max_cluster_mask.to('cpu'), annots)
                     total_miou += miou
-                    total_num_ious += num_ious
+                    total_num_ious += num_ious'''
 
 
             avg_val_loss = total_val_loss/val_iter
