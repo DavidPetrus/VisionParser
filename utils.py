@@ -80,13 +80,11 @@ def k_means(x, K):
 
         c[:] = F.normalize(c)
 
-        if FLAGS.niter == 100:
+        if i > 20:
             diff = (c - prev_c).norm()/(K**0.5)
             if diff < 0.01:
                 break
 
-
-        if i == FLAGS.niter-2 or FLAGS.niter==100:
             prev_c = c.clone()
 
     ce, num_points = concentration_estimation(D_ij,cl)
@@ -164,14 +162,12 @@ def calculate_iou(cluster_mask, annots):
         return mean_iou, num_ious / 8
 
 
-def plot_clusters(sims):
+def plot_clusters(clust_idxs):
     global color
 
-    clusters = sims.argmax(dim=1)[0].cpu().numpy()
-
-    seg = np.zeros([clusters.shape[0],clusters.shape[1],3],dtype=np.uint8)
-    for c in range(clusters.max()+1):
-        seg[clusters==c] = color[c]
+    seg = np.zeros([clust_idxs.shape[0],clust_idxs.shape[1],3],dtype=np.uint8)
+    for c in range(clust_idxs.max()+1):
+        seg[clust_idxs==c] = color[c]
     
     seg = cv2.resize(seg, (seg.shape[1]*8,seg.shape[0]*8))
     return seg

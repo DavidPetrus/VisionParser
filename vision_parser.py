@@ -17,6 +17,7 @@ class VisionParser(nn.Module):
         super(VisionParser, self).__init__()
 
         self.net = timm.create_model('resnest26d', features_only=True, pretrained=False, out_indices=(2,))
+        self.proj_head = nn.Conv2d(512,FLAGS.embd_dim,1,bias=False)
 
 
     def get_sims(self, crop_features, crop_dims, centroids, cl_idxs):
@@ -43,4 +44,4 @@ class VisionParser(nn.Module):
 
 
     def extract_feature_map(self, images):
-        return self.net(images)[0]
+        return self.proj_head(self.net(images)[0])

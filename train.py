@@ -21,19 +21,21 @@ flags.DEFINE_string('dataset','pascal','pascal,ade')
 flags.DEFINE_string('root_dir','/home/petrus/','')
 flags.DEFINE_integer('num_workers',4,'')
 flags.DEFINE_integer('batch_size',64,'')
-flags.DEFINE_float('lr',0.01,'')
+flags.DEFINE_float('lr',0.003,'')
 flags.DEFINE_integer('image_size',256,'')
 flags.DEFINE_integer('embd_dim',512,'')
 flags.DEFINE_integer('num_crops',3,'')
 flags.DEFINE_float('min_crop',0.55,'')
 flags.DEFINE_float('max_crop',0.75,'')
 flags.DEFINE_float('color_aug',0.5,'')
-flags.DEFINE_bool('main_aug',True,'')
+flags.DEFINE_bool('main_aug',False,'')
 flags.DEFINE_float('epsilon',0.001,'')
 flags.DEFINE_float('temperature',0.1,'')
+flags.DEFINE_float('margin',0.4,'')
 
-flags.DEFINE_integer('niter',20,'')
+flags.DEFINE_integer('niter',40,'')
 flags.DEFINE_bool('ce_root',True,'')
+flags.DEFINE_bool('use_ce',True,'')
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -84,7 +86,7 @@ def main(argv):
     color_aug = color_distortion()
 
     model = VisionParser()
-    optimizer = torch.optim.Adam(model.net.parameters(), lr=FLAGS.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
 
     model.to('cuda')
    
@@ -93,7 +95,7 @@ def main(argv):
     total_loss = 0.
     step_loss = 0.
     train_iter = 0
-    for epoch in range(50):
+    for epoch in range(30):
         model.train()
         # Set optimzer gradients to zero
         optimizer.zero_grad()
@@ -115,18 +117,22 @@ def main(argv):
             min_pts,max_pts = [],[]
             diffs = []
             ces = []
-            for K in [25,50,100,200]:
+            for K in [10,25,50]:
                 #print(K,datetime.datetime.now())
                 with torch.no_grad():
                     cl_idxs, centroids, ce, num_points, diff = k_means(embds, K) # (N,),(K,D),(K,),(K,)
 
                 #print(datetime.datetime.now())
 
-                sims,pos_idxs = model.get_sims([crop_features_a,crop_features_b],crop_dims,centroids,cl_idxs)
+                sims,pos_idxs = model.get_sims([crop_features_a,crop_features_b],crop_dims,centroids,cl_idxs) # (N,K), (N,)
 
                 loss = 0.
                 for cr_sims,p_idxs in zip(sims,pos_idxs):
-                    loss += F.cross_entropy(cr_sims/(FLAGS.temperature*ce[None,:]/ce.mean() + FLAGS.epsilon), p_idxs) / K
+                    pos_mask = torch.scatter(torch.zeros(cr_sims.shape[0],cr_sims.shape[1]).to('cuda'),1,p_idxs[:,None],1.)
+                    arc_sims = torch.where(pos_mask==1., torch.cos(torch.acos(cr_sims.clamp(min=-0.999)-0.001)+FLAGS.margin), cr_sims)
+                    if not FLAGS.use_ce:
+                        ce = ce.mean()
+                    loss += F.cross_entropy(arc_sims/(FLAGS.temperature*ce[None,:]/ce.mean() + FLAGS.epsilon), p_idxs) / K
 
                 losses.append(loss)
                 min_pts.append(num_points.min()/cl_idxs.shape[0])
@@ -137,7 +143,7 @@ def main(argv):
             final_loss = sum(losses)
 
             final_loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.net.parameters(), 10000.)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 10000.)
 
             optimizer.step()
             optimizer.zero_grad()
@@ -173,7 +179,7 @@ def main(argv):
 
             wandb.log(log_dict)
 
-            if train_iter == 3000:
+            if train_iter == 2000:
                 for g in optimizer.param_groups:
                     g['lr'] /= 10
 
@@ -197,14 +203,18 @@ def main(argv):
                 embds = main_features.movedim(1,3).reshape(-1, FLAGS.embd_dim)
                 
                 losses = []
-                for k_ix,K in enumerate([25,50,100,200]):
+                for k_ix,K in enumerate([10,25,50]):
                     cl_idxs, centroids, ce, num_points, diff = k_means(embds, K) # (N,),(K,D),(K,),(K,)
 
                     sims,pos_idxs = model.get_sims([crop_features_a,crop_features_b],crop_dims,centroids,cl_idxs)
 
                     loss = 0.
                     for cr_sims,p_idxs in zip(sims,pos_idxs):
-                        loss += F.cross_entropy(cr_sims/(FLAGS.temperature*ce[None,:]/ce.mean() + FLAGS.epsilon), p_idxs) / K
+                        pos_mask = torch.scatter(torch.zeros(cr_sims.shape[0],cr_sims.shape[1]).to('cuda'),1,p_idxs[:,None],1.)
+                        arc_sims = torch.where(pos_mask==1., torch.cos(torch.acos(cr_sims.clamp(min=-0.999)-0.001)+FLAGS.margin), cr_sims)
+                        if not FLAGS.use_ce:
+                            ce = ce.mean()
+                        loss += F.cross_entropy(arc_sims/(FLAGS.temperature*ce[None,:]/ce.mean() + FLAGS.epsilon), p_idxs) / K
 
                     losses.append(loss)
                     losses_k[k_ix] += loss
