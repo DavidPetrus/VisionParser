@@ -29,6 +29,8 @@ flags.DEFINE_float('min_crop',0.55,'')
 flags.DEFINE_float('max_crop',0.75,'')
 flags.DEFINE_float('color_aug',0.5,'')
 flags.DEFINE_bool('main_aug',True,'')
+flags.DEFINE_float('epsilon',0.001,'')
+flags.DEFINE_float('temperature',0.1,'')
 
 flags.DEFINE_integer('niter',20,'')
 flags.DEFINE_bool('ce_root',True,'')
@@ -112,6 +114,7 @@ def main(argv):
             losses = []
             min_pts,max_pts = [],[]
             diffs = []
+            ces = []
             for K in [25,50,100,200]:
                 #print(K,datetime.datetime.now())
                 with torch.no_grad():
@@ -123,12 +126,13 @@ def main(argv):
 
                 loss = 0.
                 for cr_sims,p_idxs in zip(sims,pos_idxs):
-                    loss += F.cross_entropy(cr_sims/(ce[None,:] + 0.001), p_idxs) / K
+                    loss += F.cross_entropy(cr_sims/(FLAGS.temperature*ce[None,:]/ce.mean() + FLAGS.epsilon), p_idxs) / K
 
                 losses.append(loss)
                 min_pts.append(num_points.min()/cl_idxs.shape[0])
                 max_pts.append(num_points.max()/cl_idxs.shape[0])
                 diffs.append(diff)
+                ces.append(ce.mean())
             
             final_loss = sum(losses)
 
@@ -141,11 +145,12 @@ def main(argv):
             log_dict = {"Epoch":epoch, "Iter":train_iter, "Loss": final_loss, "Grad Norm": grad_norm}
 
             k = 0
-            for min_k,max_k,loss_k,diff_k in zip(min_pts,max_pts,losses,diffs):
+            for min_k,max_k,loss_k,diff_k,ce_k in zip(min_pts,max_pts,losses,diffs,ces):
                 log_dict["Loss_K{}".format(k)] = loss_k
                 log_dict["MinPts_K{}".format(k)] = min_k
                 log_dict["MaxPts_K{}".format(k)] = max_k
                 log_dict["Diff_K{}".format(k)] = diff_k
+                log_dict["CE_K{}".format(k)] = ce_k
 
                 k += 1
 
@@ -168,9 +173,9 @@ def main(argv):
 
             wandb.log(log_dict)
 
-            #if train_iter == 300 or train_iter == 800:
-            #    for g in optimizer.param_groups:
-            #        g['lr'] /= 10
+            if train_iter == 3000:
+                for g in optimizer.param_groups:
+                    g['lr'] /= 10
 
         with torch.no_grad():
             val_iter = 0
@@ -199,7 +204,7 @@ def main(argv):
 
                     loss = 0.
                     for cr_sims,p_idxs in zip(sims,pos_idxs):
-                        loss += F.cross_entropy(cr_sims/(ce[None,:] + 0.001), p_idxs) / K
+                        loss += F.cross_entropy(cr_sims/(FLAGS.temperature*ce[None,:]/ce.mean() + FLAGS.epsilon), p_idxs) / K
 
                     losses.append(loss)
                     losses_k[k_ix] += loss
