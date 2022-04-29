@@ -20,13 +20,18 @@ flags.DEFINE_string('exp','test','')
 flags.DEFINE_string('dataset','pascal','pascal,ade')
 flags.DEFINE_string('root_dir','/home/petrus/','')
 flags.DEFINE_integer('num_workers',4,'')
-flags.DEFINE_integer('batch_size',48,'')
+flags.DEFINE_integer('batch_size',64,'')
 flags.DEFINE_float('lr',0.01,'')
 flags.DEFINE_integer('image_size',256,'')
 flags.DEFINE_integer('embd_dim',512,'')
 flags.DEFINE_integer('num_crops',3,'')
 flags.DEFINE_float('min_crop',0.55,'')
 flags.DEFINE_float('max_crop',0.75,'')
+flags.DEFINE_float('color_aug',0.5,'')
+flags.DEFINE_bool('main_aug',True,'')
+
+flags.DEFINE_integer('niter',20,'')
+flags.DEFINE_bool('ce_root',True,'')
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -86,13 +91,16 @@ def main(argv):
     total_loss = 0.
     step_loss = 0.
     train_iter = 0
-    for epoch in range(5):
+    for epoch in range(50):
         model.train()
         # Set optimzer gradients to zero
         optimizer.zero_grad()
         for frames_load in training_generator:
             #with torch.autograd.detect_anomaly():
-            image_batch = [color_aug(img.to('cuda')) for img in frames_load[0]]
+            if FLAGS.main_aug:
+                image_batch = [color_aug(img.to('cuda')) for img in frames_load[0]]
+            else:
+                image_batch = [frames_load[0][0].to('cuda')] + [color_aug(img.to('cuda')) for img in frames_load[0][1:]]
 
             crop_dims = frames_load[1]
             image_batch = torch.cat(image_batch, dim=0)
@@ -102,28 +110,45 @@ def main(argv):
             embds = main_features.movedim(1,3).reshape(-1, FLAGS.embd_dim)
             
             losses = []
-            for K in [10,30,100,300]:
+            min_pts,max_pts = [],[]
+            diffs = []
+            for K in [25,50,100,200]:
+                #print(K,datetime.datetime.now())
                 with torch.no_grad():
-                    cl_idxs, centroids, ce, num_points = k_means(embds, K) # (N,),(K,D),(K,),(K,)
+                    cl_idxs, centroids, ce, num_points, diff = k_means(embds, K) # (N,),(K,D),(K,),(K,)
+
+                #print(datetime.datetime.now())
 
                 sims,pos_idxs = model.get_sims([crop_features_a,crop_features_b],crop_dims,centroids,cl_idxs)
 
                 loss = 0.
                 for cr_sims,p_idxs in zip(sims,pos_idxs):
-                    loss += F.cross_entropy(cr_sims/ce[None,:], p_idxs)
+                    loss += F.cross_entropy(cr_sims/(ce[None,:] + 0.001), p_idxs) / K
 
                 losses.append(loss)
+                min_pts.append(num_points.min()/cl_idxs.shape[0])
+                max_pts.append(num_points.max()/cl_idxs.shape[0])
+                diffs.append(diff)
             
             final_loss = sum(losses)
 
             final_loss.backward()
-            #grad_norm = torch.nn.utils.clip_grad_norm_(model.net.parameters(), 10000.)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.net.parameters(), 10000.)
 
             optimizer.step()
             optimizer.zero_grad()
 
-            log_dict = {"Epoch":epoch, "Iter":train_iter, "Loss": final_loss, "Loss_K0":losses[0], "Loss_K1":losses[1], \
-                        "Loss_K2":losses[2], "Loss_K3":losses[3]}
+            log_dict = {"Epoch":epoch, "Iter":train_iter, "Loss": final_loss, "Grad Norm": grad_norm}
+
+            k = 0
+            for min_k,max_k,loss_k,diff_k in zip(min_pts,max_pts,losses,diffs):
+                log_dict["Loss_K{}".format(k)] = loss_k
+                log_dict["MinPts_K{}".format(k)] = min_k
+                log_dict["MaxPts_K{}".format(k)] = max_k
+                log_dict["Diff_K{}".format(k)] = diff_k
+
+                k += 1
+
 
             '''if train_iter % 20 == 0:
                 with torch.no_grad():
@@ -154,8 +179,10 @@ def main(argv):
             total_miou = 0
             total_num_ious = 0
             for frames_load in validation_generator:
-                
-                image_batch = [color_aug(img.to('cuda')) for img in frames_load[0]]
+                if FLAGS.main_aug:
+                    image_batch = [color_aug(img.to('cuda')) for img in frames_load[0]]
+                else:
+                    image_batch = [frames_load[0][0].to('cuda')] + [color_aug(img.to('cuda')) for img in frames_load[0][1:]]
 
                 crop_dims = frames_load[1]
                 image_batch = torch.cat(image_batch, dim=0)
@@ -165,14 +192,14 @@ def main(argv):
                 embds = main_features.movedim(1,3).reshape(-1, FLAGS.embd_dim)
                 
                 losses = []
-                for k_ix,K in enumerate([10,30,100,300]):
-                    cl_idxs, centroids, ce, num_points = k_means(embds, K) # (N,),(K,D),(K,),(K,)
+                for k_ix,K in enumerate([25,50,100,200]):
+                    cl_idxs, centroids, ce, num_points, diff = k_means(embds, K) # (N,),(K,D),(K,),(K,)
 
                     sims,pos_idxs = model.get_sims([crop_features_a,crop_features_b],crop_dims,centroids,cl_idxs)
 
                     loss = 0.
                     for cr_sims,p_idxs in zip(sims,pos_idxs):
-                        loss += F.cross_entropy(sims/ce[None,:], p_idxs)
+                        loss += F.cross_entropy(cr_sims/(ce[None,:] + 0.001), p_idxs) / K
 
                     losses.append(loss)
                     losses_k[k_ix] += loss

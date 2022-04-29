@@ -51,22 +51,23 @@ def random_crop(image, crop_dims=None, min_crop=None):
     return crop, [crop_x,crop_y,crop_size]
     
 
-def k_means(x, K, Niter=20):
+def k_means(x, K):
     N = x.shape[0]
     x = F.normalize(x)
     step = int(N/K)
     c = x[step::step, :][:K].clone()  # (K,D) Simplistic initialization for the centroids
+    prev_c = c.clone()
     assert c.shape[0] == K
 
     x_i = LazyTensor(x.view(N, 1, FLAGS.embd_dim))  # (N, 1, D) samples
     c_j = LazyTensor(c.view(1, K, FLAGS.embd_dim))  # (1, K, D) centroids
 
-    for i in range(Niter):
+    for i in range(FLAGS.niter):
 
         # E step: assign points to the closest cluster -------------------------
         #D_ij = ((x_i - c_j) ** 2).sum(-1)  # (N, K) symbolic squared distances
         D_ij = 1 - (x_i | c_j) # (N, K)
-        cl = D_ij.argmin(dim=1).long().view(-1)  # (N,) Points -> Nearest cluster 
+        cl = D_ij.argmin(dim=1).long().view(-1)  # (N,) Points -> Nearest cluster
 
         # M step: update the centroids to the normalized cluster average: ------
         # Compute the sum of points per cluster:
@@ -79,20 +80,37 @@ def k_means(x, K, Niter=20):
 
         c[:] = F.normalize(c)
 
-        # Add criteria to break
+        if FLAGS.niter == 100:
+            diff = (c - prev_c).norm()/(K**0.5)
+            if diff < 0.01:
+                break
+
+
+        if i == FLAGS.niter-2 or FLAGS.niter==100:
+            prev_c = c.clone()
 
     ce, num_points = concentration_estimation(D_ij,cl)
 
-    return cl, c, ce, num_points
+    #unique,counts = torch.unique(cl,return_counts=True)
+    #print(counts.sort()[0]/cl.shape[0])
+
+    diff = (c - prev_c).norm()/(K**0.5)
+
+    return cl, c, ce, num_points, diff
 
 
 def concentration_estimation(dists,cl):
     centroid_dists = dists.min(dim=1)[:,0] # (N,)
     num_points_per_clust = torch.bincount(cl) # (K,)
+    if dists.shape[1]-5 < num_points_per_clust.shape[0] < dists.shape[1]:
+        print("Num Points", num_points_per_clust.shape[0], dists.shape[1])
+        num_points_per_clust = torch.bincount(cl, minlength=dists.shape[1]) # (K,)
+
     assert num_points_per_clust.shape[0] == dists.shape[1]
-    centroid_dists = centroid_dists**0.5
-    avg_dist = torch.scatter_add(torch.zeros(dists.shape[1]).to('cuda'), 0, cl, centroid_dists) / num_points_per_clust
-    ce = avg_dist / (num_points_per_clust * torch.log(num_points_per_clust + 10))
+    if FLAGS.ce_root:
+        centroid_dists = torch.sqrt(torch.clamp(centroid_dists,min=0.))
+    avg_dist = torch.scatter_add(torch.zeros(dists.shape[1]).to('cuda'), 0, cl, centroid_dists) / (num_points_per_clust + 1)
+    ce = avg_dist / torch.log(num_points_per_clust + 10)
 
     return ce, num_points_per_clust
 
@@ -116,8 +134,8 @@ def off_diagonal(x):
     return x.reshape(b,-1)[:,:-1].reshape(b, n - 1, n + 1)[:,:,1:].reshape(b,-1)
 
 
-def color_distortion(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1):
-    color_jitter = torchvision.transforms.ColorJitter(brightness,contrast,saturation,hue)
+def color_distortion():
+    color_jitter = torchvision.transforms.ColorJitter(FLAGS.color_aug,FLAGS.color_aug,FLAGS.color_aug,FLAGS.color_aug*0.2)
     return color_jitter
 
 
