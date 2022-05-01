@@ -5,6 +5,7 @@ import torchvision
 import cv2
 #import matplotlib.pyplot as plt
 import time
+from kornia.filters import sobel
 from pykeops.torch import LazyTensor
 
 from absl import flags
@@ -55,7 +56,7 @@ def k_means(x, K):
     N = x.shape[0]
     x = F.normalize(x)
     step = int(N/K)
-    c = x[step::step, :][:K].clone()  # (K,D) Simplistic initialization for the centroids
+    c = x[::step, :][:K].clone()  # (K,D) Simplistic initialization for the centroids
     prev_c = c.clone()
     assert c.shape[0] == K
 
@@ -82,7 +83,7 @@ def k_means(x, K):
 
         if i > 20:
             diff = (c - prev_c).norm()/(K**0.5)
-            if diff < 0.01:
+            if diff < FLAGS.diff_thresh:
                 break
 
             prev_c = c.clone()
@@ -111,6 +112,19 @@ def concentration_estimation(dists,cl):
     ce = avg_dist / torch.log(num_points_per_clust + 10)
 
     return ce, num_points_per_clust
+
+
+def sobel_filter(imgs):
+    with torch.no_grad():
+        sobel_mags = sobel(imgs).mean(1) # B,H,W
+        if FLAGS.sobel_mag_thresh > 0:
+            sobel_mags[sobel_mags < FLAGS.sobel_mag_thresh] = 0.
+            sobel_mags[sobel_mags >= FLAGS.sobel_mag_thresh] = 1.
+
+        sobel_mags = sobel_mags.reshape(FLAGS.batch_size,32,8,32,8).movedim(2,3).mean([3,4]).reshape(-1) # N
+        sobel_mask = sobel_mags < FLAGS.sobel_pix_thresh
+
+    return sobel_mask
 
 
 def vic_reg(x):
