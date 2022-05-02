@@ -11,6 +11,8 @@ from vision_parser import VisionParser
 from dataloader import ADE20k_Dataset, PascalVOC
 from utils import color_distortion, calculate_iou, k_means, sobel_filter
 
+from scipy.optimize import linear_sum_assignment
+
 import wandb
 
 from absl import flags, app
@@ -22,12 +24,12 @@ flags.DEFINE_string('dataset','pascal','pascal,ade')
 flags.DEFINE_string('root_dir','/home/petrus/','')
 flags.DEFINE_integer('num_workers',4,'')
 flags.DEFINE_integer('batch_size',128,'')
-flags.DEFINE_float('lr',0.01,'')
+flags.DEFINE_float('lr',0.003,'')
 flags.DEFINE_integer('image_size',256,'')
 flags.DEFINE_integer('embd_dim',512,'')
 flags.DEFINE_integer('num_crops',3,'')
-flags.DEFINE_float('min_crop',0.55,'')
-flags.DEFINE_float('max_crop',0.75,'')
+flags.DEFINE_float('min_crop',0.75,'')
+flags.DEFINE_float('max_crop',0.95,'')
 flags.DEFINE_float('color_aug',0.8,'')
 flags.DEFINE_bool('main_aug',False,'')
 
@@ -43,6 +45,13 @@ flags.DEFINE_bool('use_ce',True,'')
 
 flags.DEFINE_float('sobel_mag_thresh',0.1,'')
 flags.DEFINE_float('sobel_pix_thresh',0.2,'')
+
+flags.DEFINE_integer('num_prototypes',50,'')
+flags.DEFINE_integer('min_pts',20,'')
+flags.DEFINE_float('max_clust_size',0.1,'')
+flags.DEFINE_string('selection_method','eom','')
+flags.DEFINE_float('frac_per_img',0.1,'')
+flags.DEFINE_string('cluster_metric','euc','')
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -117,67 +126,57 @@ def main(argv):
 
             crop_dims = frames_load[1]
 
+            main_features = model.extract_feature_map(image_batch[0])
+            embds = main_features.movedim(1,3).reshape(-1, FLAGS.embd_dim)
+
+            sampled_indices = torch.randint(32*32,(FLAGS.batch_size, int(FLAGS.frac_per_img*32*32)),device=torch.device('cuda'))
+            sampled_mask = torch.scatter(torch.zeros(FLAGS.batch_size,32*32,dtype=torch.long,device=torch.device('cuda')), 1, sampled_indices, 1).reshape(-1).bool() # (N,)
+
+            sobel_mask = sobel_filter(image_batch[0]) # N
+            final_mask = sobel_mask & sampled_mask
+            embds = embds[final_mask]
+            norm_embds = F.normalize(embds)
             with torch.no_grad():
-                main_features = model.extract_feature_map(image_batch[0])
-                embds = main_features.movedim(1,3).reshape(-1, FLAGS.embd_dim)
+                if FLAGS.cluster_metric == 'euc':
+                    dists = torch.cdist(embds.unsqueeze(0),embds.unsqueeze(0))[0]**2
+                elif FLAGS.cluster_metric == 'cosine':
+                    dists = 1 - norm_embds @ norm_embds.T
 
-                sobel_mask = sobel_filter(image_batch[0]) # N
-                embds = embds[sobel_mask]
-                
-                min_pts,max_pts = [],[]
-                diffs = []
-                ces = []
-                centr_sims = []
-                centroids_K = []
-                cl_idxs_K = []
-                for K in all_Ks:
-                    with torch.no_grad():
-                        cl_idxs, centroids, ce, num_points, diff = k_means(embds, K) # (N,),(K,D),(K,),(K,)
-                        cl_idxs = torch.scatter(-torch.ones(sobel_mask.shape[0],dtype=torch.long).to('cuda'), 0, sobel_mask.nonzero().reshape(-1), cl_idxs)
-                        centr_sims.append(((centroids @ centroids.T).sum() - K)/(K*(K-1)))
+                cl_labels, cl_probs = model.cluster_features(dists.cpu().numpy().astype(np.float64)) # (M/N,) (M/N,)
+                cl,clust_freqs = np.unique(cl_labels, return_counts=True) # (K+1,), (K+1,)
+                cl_mask = torch.tensor(cl_labels != -1, device=torch.device('cuda'))
+                assert cl[0] == -1
 
-                        min_pts.append(num_points.min()/cl_idxs.shape[0])
-                        max_pts.append(num_points.max()/cl_idxs.shape[0])
-                        diffs.append(diff)
-                        ces.append(ce)
-                        centroids_K.append(centroids)
-                        cl_idxs_K.append(cl_idxs)
+            cl_labels = torch.tensor(cl_labels,device=torch.device('cuda'))
+            proto_sims = norm_embds[cl_mask] @ model.prototypes.T # (M/N, num_prototypes)
+            mean_sims = torch.scatter_add(torch.zeros(len(cl)-1,FLAGS.num_prototypes,device=torch.device('cuda')),0, \
+                                          cl_labels[cl_labels != -1][:,None].tile(1,FLAGS.num_prototypes),proto_sims) / \
+                                          torch.tensor(clust_freqs[1:,None],device=torch.device('cuda')) # (K,num_prototypes)
 
+            row_ind,col_ind = linear_sum_assignment(-mean_sims.detach().cpu().numpy())
+            cl_loss = F.cross_entropy(mean_sims/FLAGS.temperature, torch.tensor(col_ind,device=torch.device('cuda')))
+            cl_loss.backward()
+
+            cl_idxs = torch.scatter(-torch.ones(final_mask.shape[0],dtype=torch.long,device=torch.device('cuda')), 0, final_mask.nonzero().reshape(-1), cl_labels) # (N,)
             
             for cr_img,cr_dims in zip(image_batch[1:],crop_dims):
                 crop_features = model.extract_feature_map(cr_img)
                 crop_features = F.normalize(crop_features)
-                losses = []
-                for K,centroids,cl_idxs,ce in zip(all_Ks,centroids_K,cl_idxs_K,ces):
-                    cr_features,p_idxs = model.mask_crop_feats(crop_features,cr_dims,cl_idxs) # (N,D), (N,)
-                    cr_sims = cr_features @ centroids.T # (N,K)
+                
+                cr_features,p_idxs = model.mask_crop_feats(crop_features,cr_dims,cl_idxs) # (M'/N,D), (M'/N,)
+                cr_sims = cr_features @ model.prototypes.T # (M'/N,K)
 
-                    pos_mask = torch.scatter(torch.zeros(cr_sims.shape[0],cr_sims.shape[1]).to('cuda'),1,p_idxs[:,None],1.)
-                    arc_sims = torch.where(pos_mask==1., torch.cos(torch.acos(cr_sims.clamp(min=-0.999)-0.001)+FLAGS.margin), cr_sims)
-                    if not FLAGS.use_ce:
-                        loss = F.cross_entropy(arc_sims/FLAGS.temperature, p_idxs) / K
-                    else:
-                        loss = F.cross_entropy(arc_sims/(FLAGS.temperature*ce[None,:]/ce.mean() + FLAGS.epsilon), p_idxs) / K
+                pos_mask = torch.scatter(torch.zeros(cr_sims.shape[0],cr_sims.shape[1],device=torch.device('cuda')),1,p_idxs[:,None],1.)
+                arc_sims = torch.where(pos_mask==1., torch.cos(torch.acos(cr_sims.clamp(min=-0.999)-0.001)+FLAGS.margin), cr_sims)
+                crop_loss = F.cross_entropy(arc_sims/FLAGS.temperature, p_idxs)
 
-                    losses.append(loss)
-                    
-                final_loss = sum(losses)
+                crop_loss.backward()
 
-                final_loss.backward()
-
-                log_dict = {"Epoch":epoch, "Iter":train_iter, "Loss": final_loss, \
-                        "Frac Masked": 1-sobel_mask.sum()/sobel_mask.shape[0], "Crop Frac Masked": 1-p_idxs.shape[0]/sobel_mask.shape[0]}
-
-                k = 0
-                for min_k,max_k,loss_k,diff_k,ce_k,c_sim in zip(min_pts,max_pts,losses,diffs,ces,centr_sims):
-                    log_dict["Loss_K{}".format(k)] = loss_k
-                    log_dict["MinPts_K{}".format(k)] = min_k
-                    log_dict["MaxPts_K{}".format(k)] = max_k
-                    log_dict["Diff_K{}".format(k)] = diff_k
-                    log_dict["CE_K{}".format(k)] = ce_k.mean()
-                    log_dict["CentSim_K{}".format(k)] = c_sim
-
-                    k += 1
+            log_dict = {"Epoch":epoch, "Iter":train_iter, "CL Loss": cl_loss, "Crop Loss": crop_loss, \
+                    "Frac Masked": 1-sobel_mask.sum()/sobel_mask.shape[0], "Crop Frac Masked": 1-p_idxs.shape[0]/sobel_mask.shape[0], \
+                    "Total Masked": 1-final_mask.sum()/final_mask.shape[0], "Avg Cluster Probability": cl_probs[cl_probs != 0].mean(), \
+                    "Frac Noise Pts": clust_freqs[0]/cl_probs.shape[0], "Num Clusters": len(clust_freqs)-1, \
+                    "Min Clust": clust_freqs[1:].min()/clust_freqs[1:].sum(), "Max Clust": clust_freqs[1:].max()/clust_freqs[1:].sum()}
             
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 10000.)
             log_dict["Grad Norm"] = grad_norm
@@ -209,7 +208,8 @@ def main(argv):
 
         with torch.no_grad():
             val_iter = 0
-            total_val_loss = 0.
+            total_cl_loss = 0.
+            total_cr_loss = 0.
             losses_k = [0.,0.,0.,0.]
             total_miou = 0
             total_num_ious = 0
@@ -223,62 +223,69 @@ def main(argv):
                 main_features = model.extract_feature_map(image_batch[0])
                 embds = main_features.movedim(1,3).reshape(-1, FLAGS.embd_dim)
 
+                sampled_indices = torch.randint(32*32,(FLAGS.batch_size, int(FLAGS.frac_per_img*32*32)),device=torch.device('cuda'))
+                sampled_mask = torch.scatter(torch.zeros(FLAGS.batch_size,32*32,dtype=torch.long,device=torch.device('cuda')), 1, sampled_indices, 1).reshape(-1).bool() # (N,)
+
                 sobel_mask = sobel_filter(image_batch[0]) # N
-                embds = embds[sobel_mask]
+                final_mask = sobel_mask & sampled_mask
+                embds = embds[final_mask]
+                norm_embds = F.normalize(embds)
                 
-                ces = []
-                centr_sims = []
-                centroids_K = []
-                cl_idxs_K = []
-                for K in all_Ks:
-                    with torch.no_grad():
-                        cl_idxs, centroids, ce, num_points, diff = k_means(embds, K) # (N,),(K,D),(K,),(K,)
-                        cl_idxs = torch.scatter(-torch.ones(sobel_mask.shape[0],dtype=torch.long).to('cuda'), 0, sobel_mask.nonzero().reshape(-1), cl_idxs)
-                        centr_sims.append(((centroids @ centroids.T).sum() - K)/(K*(K-1)))
+                if FLAGS.cluster_metric == 'euc':
+                    dists = torch.cdist(embds.unsqueeze(0),embds.unsqueeze(0))[0]**2
+                elif FLAGS.cluster_metric == 'cosine':
+                    dists = 1 - norm_embds @ norm_embds.T
 
-                        ces.append(ce)
-                        centroids_K.append(centroids)
-                        cl_idxs_K.append(cl_idxs)
+                cl_labels, cl_probs = model.cluster_features(dists.cpu().numpy().astype(np.float64)) # (M/N,) (M/N,)
+                cl,clust_freqs = np.unique(cl_labels, return_counts=True) # (K+1,), (K+1,)
+                cl_mask = torch.tensor(cl_labels != -1, device=torch.device('cuda'))
+                assert cl[0] == -1
 
-            
-                losses = []
+                cl_labels = torch.tensor(cl_labels,device=torch.device('cuda'))
+                proto_sims = norm_embds[cl_mask] @ model.prototypes.T # (M/N, num_prototypes)
+                mean_sims = torch.scatter_add(torch.zeros(len(cl)-1,FLAGS.num_prototypes,device=torch.device('cuda')),0, \
+                                              cl_labels[cl_labels != -1][:,None].tile(1,FLAGS.num_prototypes),proto_sims) / \
+                                              torch.tensor(clust_freqs[1:,None],device=torch.device('cuda')) # (K,num_prototypes)
+
+                row_ind,col_ind = linear_sum_assignment(-mean_sims.detach().cpu().numpy())
+                cl_loss = F.cross_entropy(mean_sims/FLAGS.temperature, torch.tensor(col_ind,device=torch.device('cuda')))
+
+                cl_idxs = torch.scatter(-torch.ones(final_mask.shape[0],dtype=torch.long,device=torch.device('cuda')), 0, final_mask.nonzero().reshape(-1), cl_labels) # (N,)
+                
                 for cr_img,cr_dims in zip(image_batch[1:],crop_dims):
                     crop_features = model.extract_feature_map(cr_img)
                     crop_features = F.normalize(crop_features)
                     
-                    for K,centroids,cl_idxs,ce in zip(all_Ks,centroids_K,cl_idxs_K,ces):
-                        cr_features,p_idxs = model.mask_crop_feats(crop_features,cr_dims,cl_idxs) # (N,D), (N,)
-                        cr_sims = cr_features @ centroids.T # (N,K)
-                        if not FLAGS.use_ce:
-                            loss = F.cross_entropy(cr_sims/FLAGS.temperature, p_idxs) / K
-                        else:
-                            loss = F.cross_entropy(cr_sims/(FLAGS.temperature*ce[None,:]/ce.mean() + FLAGS.epsilon), p_idxs) / K
+                    cr_features,p_idxs = model.mask_crop_feats(crop_features,cr_dims,cl_idxs) # (M'/N,D), (M'/N,)
+                    cr_sims = cr_features @ model.prototypes.T # (M'/N,K)
 
-                        losses.append(loss)
+                    pos_mask = torch.scatter(torch.zeros(cr_sims.shape[0],cr_sims.shape[1],device=torch.device('cuda')),1,p_idxs[:,None],1.)
+                    arc_sims = torch.where(pos_mask==1., torch.cos(torch.acos(cr_sims.clamp(min=-0.999)-0.001)+FLAGS.margin), cr_sims)
+                    crop_loss = F.cross_entropy(arc_sims/FLAGS.temperature, p_idxs)
                 
-                total_val_loss += sum(losses)/len(crop_dims)
+                total_cl_loss += cl_loss
+                total_cr_loss += crop_loss
 
                 val_iter += 1
 
-                '''with torch.no_grad():
-                    annots = frames_load[2]
-                    miou, num_ious = calculate_iou(max_cluster_mask.to('cpu'), annots)
-                    total_miou += miou
-                    total_num_ious += num_ious'''
+                '''annots = frames_load[2]
+                miou, num_ious = calculate_iou(max_cluster_mask.to('cpu'), annots)
+                total_miou += miou
+                total_num_ious += num_ious'''
 
 
-            avg_val_loss = total_val_loss/val_iter
-            log_dict = {"Epoch":epoch, "Val Loss": avg_val_loss}
-            #            "Val Loss_K0":losses_k[0]/val_iter, "Val Loss_K1":losses_k[1]/val_iter, \
-            #            "Val Loss_K2":losses_k[2]/val_iter}
+            avg_cl_loss = total_cl_loss/val_iter
+            avg_cr_loss = total_cr_loss/val_iter
+            log_dict = {"Epoch":epoch, "Val CL Loss": avg_cl_loss, "Val CR Loss": avg_cr_loss}
             
             print(log_dict)
 
             wandb.log(log_dict)
 
-            if avg_val_loss < min_loss:
+            if avg_cl_loss+avg_cr_loss < min_loss:
                 torch.save(model.state_dict(),'weights/{}.pt'.format(FLAGS.exp))
-                min_loss = avg_val_loss
+                torch.save({'net':model.net,'proj_head':model.proj_head,'prototypes':model.prototypes},'weights/{}.pt'.format(FLAGS.exp))
+                min_loss = avg_cl_loss+avg_cr_loss
         
 
 if __name__ == '__main__':

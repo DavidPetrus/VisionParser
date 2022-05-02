@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 import cv2
+import hdbscan
 
 from absl import flags
 
@@ -18,6 +19,17 @@ class VisionParser(nn.Module):
 
         self.net = timm.create_model('resnest26d', features_only=True, pretrained=False, out_indices=(2,))
         self.proj_head = nn.Conv2d(512,FLAGS.embd_dim,1,bias=False)
+
+        self.prototypes = F.normalize(torch.randn(FLAGS.num_prototypes,FLAGS.embd_dim,device=torch.device('cuda')))
+
+        self.clusterer = hdbscan.HDBSCAN(min_cluster_size=FLAGS.min_pts, max_cluster_size=int(FLAGS.max_clust_size*FLAGS.frac_per_img*FLAGS.batch_size*32*32), \
+                                         metric='precomputed', cluster_selection_method=FLAGS.selection_method)
+
+
+    def cluster_features(self, dists):
+        cluster_labels = self.clusterer.fit(dists)
+
+        return cluster_labels.labels_, cluster_labels.probabilities_
 
 
     def mask_crop_feats(self, cr_features, cr_dims, cl_idxs):
