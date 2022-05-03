@@ -23,7 +23,7 @@ flags.DEFINE_string('dataset','pascal','pascal,ade')
 flags.DEFINE_string('root_dir','/home/petrus/','')
 flags.DEFINE_integer('num_workers',4,'')
 flags.DEFINE_integer('batch_size',128,'')
-flags.DEFINE_float('lr',0.003,'')
+flags.DEFINE_float('lr',0.001,'')
 flags.DEFINE_integer('image_size',256,'')
 flags.DEFINE_integer('embd_dim',512,'')
 flags.DEFINE_integer('num_crops',5,'')
@@ -35,20 +35,21 @@ flags.DEFINE_bool('main_aug',False,'')
 flags.DEFINE_float('epsilon',0.001,'')
 flags.DEFINE_float('temperature',0.1,'')
 flags.DEFINE_float('cl_margin',0.4,'')
-flags.DEFINE_float('cr_margin',0.,'')
+flags.DEFINE_float('cr_margin',0.4,'')
 
 flags.DEFINE_float('sobel_mag_thresh',0.14,'')
 flags.DEFINE_float('sobel_pix_thresh',0.2,'')
 
-flags.DEFINE_integer('num_prototypes',100,'')
+flags.DEFINE_integer('num_prototypes',150,'')
 flags.DEFINE_integer('min_pts',20,'')
 flags.DEFINE_integer('min_samples',5,'')
 flags.DEFINE_float('max_clust_size',0.2,'')
 flags.DEFINE_string('selection_method','eom','')
 flags.DEFINE_float('frac_per_img',0.1,'')
-flags.DEFINE_string('cluster_metric','euc','')
+flags.DEFINE_string('cluster_metric','cosine','')
 flags.DEFINE_bool('update_b4_crop',False,'')
 flags.DEFINE_float('noise_coeff',0.,'')
+flags.DEFINE_float('cl_coeff',3,'')
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -108,7 +109,7 @@ def main(argv):
     total_loss = 0.
     step_loss = 0.
     train_iter = 0
-    for epoch in range(10):
+    for epoch in range(15):
         model.train()
         # Set optimzer gradients to zero
         optimizer.zero_grad()
@@ -150,8 +151,9 @@ def main(argv):
 
             if FLAGS.noise_coeff > 0:
                 with torch.no_grad():
-                    noise_sims = norm_embds[~cl_mask] @ model.prototypes.T # (num_noise,num_prototypes)
+                    noise_sims = norm_embds[cl_labels == -1] @ model.prototypes.T # (num_noise,num_prototypes)
                     noise_idxs = noise_sims.argmax(dim=1) # (num_noise,)
+                    cl_labels.scatter_(0,(cl_labels==-1).nonzero().reshape(-1),-noise_idxs-2)
 
             row_ind,col_ind = linear_sum_assignment(-mean_sims.detach().cpu().numpy())
             col_ind = torch.tensor(col_ind,device=torch.device('cuda')) # (K,)|num_prototypes|
@@ -161,7 +163,8 @@ def main(argv):
                 cl_loss = F.cross_entropy(arc_sims/FLAGS.temperature, col_ind)
             else:
                 cl_loss = F.cross_entropy(mean_sims/FLAGS.temperature, col_ind)
-            cl_loss.backward()
+
+            (FLAGS.cl_coeff*cl_loss).backward()
 
             if FLAGS.update_b4_crop:
                 optimizer.step()
@@ -196,9 +199,19 @@ def main(argv):
                     crop_loss = F.cross_entropy(mean_sims/FLAGS.temperature, cr_ind)
 
 
-                crop_loss.backward()
+                if FLAGS.noise_coeff > 0.:
+                    noise_idxs = -crop_idxs[crop_idxs < -1] - 2 # (num_noise',)|num_prototypes|
+                    noise_features = norm_features[crop_idxs < -1] # (num_noise',embd_dim)
+                    noise_sims = noise_features @ model.prototypes.T # (num_noise',num_prototypes)
 
-            log_dict = {"Epoch":epoch, "Iter":train_iter, "CL Loss": cl_loss, "Crop Loss": crop_loss, \
+                    noise_loss = F.cross_entropy(noise_sims/FLAGS.temperature, noise_idxs)
+                else:
+                    noise_loss = 0.
+
+                final_crop_loss = crop_loss + FLAGS.noise_coeff*noise_loss
+                final_crop_loss.backward()
+
+            log_dict = {"Epoch":epoch, "Iter":train_iter, "CL Loss": cl_loss, "Crop Loss": crop_loss, "Noise Loss": noise_loss, \
                     "Frac Masked": 1-sobel_mask.sum()/sobel_mask.shape[0], "Crop Frac Masked": 1-p_idxs.shape[0]/sobel_mask.shape[0], \
                     "Total Masked": 1-final_mask.sum()/final_mask.shape[0], "Avg Cluster Probability": cl_probs[cl_probs != 0].mean(), \
                     "Frac Noise Pts": clust_freqs[0]/cl_probs.shape[0], "Num Clusters": len(clust_freqs)-1, \
@@ -229,7 +242,7 @@ def main(argv):
 
             wandb.log(log_dict)
 
-            if train_iter == 400:
+            if train_iter == 600:
                 for g in optimizer.param_groups:
                     g['lr'] /= 10
 
@@ -275,7 +288,7 @@ def main(argv):
                                               torch.tensor(clust_freqs[1:,None],device=torch.device('cuda')) # (K,num_prototypes)
 
                 row_ind,col_ind = linear_sum_assignment(-mean_sims.detach().cpu().numpy())
-                col_ind = torch.tensor(col_ind,device=torch.device('cuda'))
+                col_ind = torch.tensor(col_ind,device=torch.device('cuda')) # (K,)|num_prototypes|
                 cl_loss = F.cross_entropy(mean_sims/FLAGS.temperature, col_ind)
 
                 cl_idxs = torch.scatter(-torch.ones(final_mask.shape[0],dtype=torch.long,device=torch.device('cuda')), 0, final_mask.nonzero().reshape(-1), cl_labels) # (N,)
@@ -284,7 +297,9 @@ def main(argv):
                     crop_features = model.extract_feature_map(cr_img)
                     crop_features = F.normalize(crop_features)
                     
-                    cr_features,p_idxs = model.mask_crop_feats(crop_features,cr_dims,cl_idxs) # (M'/N,D), (M'/N,)
+                    norm_features,crop_idxs = model.mask_crop_feats(crop_features,cr_dims,cl_idxs) # (M'/N,D), (M'/N,)|K|
+                    cr_features = norm_features[crop_idxs > -1]
+                    p_idxs = crop_idxs[crop_idxs > -1]
                     cr_cl,cr_freqs = torch.unique(p_idxs,return_counts=True)
                     cr_ind = torch.gather(col_ind,0,cr_cl) # (K',)|num_prototypes|
                     
