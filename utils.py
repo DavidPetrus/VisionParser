@@ -6,7 +6,6 @@ import cv2
 #import matplotlib.pyplot as plt
 import time
 from kornia.filters import sobel
-from pykeops.torch import LazyTensor
 
 from absl import flags
 
@@ -176,12 +175,3 @@ def calculate_iou(cluster_mask, annots):
         return mean_iou, num_ious / 8
 
 
-def plot_clusters(clust_idxs):
-    global color
-
-    seg = np.zeros([clust_idxs.shape[0],clust_idxs.shape[1],3],dtype=np.uint8)
-    for c in range(clust_idxs.max()+1):
-        seg[clust_idxs==c] = color[c]
-    
-    seg = cv2.resize(seg, (seg.shape[1]*8,seg.shape[0]*8), interpolation=cv2.INTER_NEAREST)
-    return seg

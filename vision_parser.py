@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-import cv2
 import hdbscan
 
 from absl import flags
@@ -41,8 +40,6 @@ class VisionParser(nn.Module):
         crop_idxs = crop_idxs.reshape(-1).long() # (N,)
 
         norm_features = cr_features.movedim(1,3).reshape(-1, FLAGS.embd_dim)
-        norm_features = norm_features[crop_idxs != -1]
-        crop_idxs = crop_idxs[crop_idxs != -1]
 
         return norm_features, crop_idxs
 

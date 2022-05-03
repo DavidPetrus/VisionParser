@@ -34,6 +34,17 @@ flags.DEFINE_float('sobel_mag_thresh',0.14,'')
 flags.DEFINE_float('sobel_pix_thresh',0.2,'')
 
 
+def plot_clusters(clust_idxs):
+    global color
+
+    seg = np.zeros([clust_idxs.shape[0],clust_idxs.shape[1],3],dtype=np.uint8)
+    for c in range(clust_idxs.max()+1):
+        seg[clust_idxs==c] = color[c]
+    
+    seg = cv2.resize(seg, (seg.shape[1]*8,seg.shape[0]*8), interpolation=cv2.INTER_NEAREST)
+    return seg
+
+
 def main(argv):
 
     all_images = glob.glob(FLAGS.root_dir+"VOCdevkit/VOC2012/trainval/trainval/*.mat")

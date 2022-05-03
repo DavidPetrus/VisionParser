@@ -1,5 +1,4 @@
 import numpy as np
-import cv2
 import torch
 import torch.nn.functional as F
 import glob
@@ -27,7 +26,7 @@ flags.DEFINE_integer('batch_size',128,'')
 flags.DEFINE_float('lr',0.003,'')
 flags.DEFINE_integer('image_size',256,'')
 flags.DEFINE_integer('embd_dim',512,'')
-flags.DEFINE_integer('num_crops',3,'')
+flags.DEFINE_integer('num_crops',5,'')
 flags.DEFINE_float('min_crop',0.75,'')
 flags.DEFINE_float('max_crop',0.95,'')
 flags.DEFINE_float('color_aug',0.8,'')
@@ -42,13 +41,14 @@ flags.DEFINE_float('sobel_mag_thresh',0.14,'')
 flags.DEFINE_float('sobel_pix_thresh',0.2,'')
 
 flags.DEFINE_integer('num_prototypes',100,'')
-flags.DEFINE_integer('min_pts',10,'')
-flags.DEFINE_integer('min_samples',10,'')
+flags.DEFINE_integer('min_pts',20,'')
+flags.DEFINE_integer('min_samples',5,'')
 flags.DEFINE_float('max_clust_size',0.2,'')
 flags.DEFINE_string('selection_method','eom','')
 flags.DEFINE_float('frac_per_img',0.1,'')
 flags.DEFINE_string('cluster_metric','euc','')
 flags.DEFINE_bool('update_b4_crop',False,'')
+flags.DEFINE_float('noise_coeff',0.,'')
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -148,35 +148,53 @@ def main(argv):
                                           cl_labels[cl_labels != -1][:,None].tile(1,FLAGS.num_prototypes),proto_sims) / \
                                           torch.tensor(clust_freqs[1:,None],device=torch.device('cuda')) # (K,num_prototypes)
 
+            if FLAGS.noise_coeff > 0:
+                with torch.no_grad():
+                    noise_sims = norm_embds[~cl_mask] @ model.prototypes.T # (num_noise,num_prototypes)
+                    noise_idxs = noise_sims.argmax(dim=1) # (num_noise,)
+
             row_ind,col_ind = linear_sum_assignment(-mean_sims.detach().cpu().numpy())
+            col_ind = torch.tensor(col_ind,device=torch.device('cuda')) # (K,)|num_prototypes|
             if FLAGS.cl_margin > 0.:
-                pos_mask = torch.scatter(torch.zeros(mean_sims.shape[0],mean_sims.shape[1],device=torch.device('cuda')),1,torch.tensor(col_ind,device=torch.device('cuda'))[:,None],1.)
+                pos_mask = torch.scatter(torch.zeros(mean_sims.shape[0],mean_sims.shape[1],device=torch.device('cuda')),1,col_ind[:,None],1.)
                 arc_sims = torch.where(pos_mask==1., torch.cos(torch.acos(mean_sims.clamp(min=-0.999)-0.001)+FLAGS.cl_margin), mean_sims)
-                cl_loss = F.cross_entropy(arc_sims/FLAGS.temperature, torch.tensor(col_ind,device=torch.device('cuda')))
+                cl_loss = F.cross_entropy(arc_sims/FLAGS.temperature, col_ind)
             else:
-                cl_loss = F.cross_entropy(mean_sims/FLAGS.temperature, torch.tensor(col_ind,device=torch.device('cuda')))
+                cl_loss = F.cross_entropy(mean_sims/FLAGS.temperature, col_ind)
             cl_loss.backward()
 
             if FLAGS.update_b4_crop:
                 optimizer.step()
                 optimizer.zero_grad()
 
-            cl_idxs = torch.scatter(-torch.ones(final_mask.shape[0],dtype=torch.long,device=torch.device('cuda')), 0, final_mask.nonzero().reshape(-1), cl_labels) # (N,)
-            noise_fracs = (cl_idxs.reshape(FLAGS.batch_size,32*32) == -1).sum(1) / (32*32)
+            cl_idxs = torch.scatter(-2*torch.ones(final_mask.shape[0],dtype=torch.long,device=torch.device('cuda')), 0, final_mask.nonzero().reshape(-1), cl_labels) # (N,)
+
+            noise_fracs = (cl_idxs.reshape(FLAGS.batch_size,32*32) < -1).sum(1) / (32*32)
             
             for cr_img,cr_dims in zip(image_batch[1:],crop_dims):
                 crop_features = model.extract_feature_map(cr_img)
                 crop_features = F.normalize(crop_features)
                 
-                cr_features,p_idxs = model.mask_crop_feats(crop_features,cr_dims,cl_idxs) # (M'/N,D), (M'/N,)
-                cr_sims = cr_features @ model.prototypes.T # (M'/N,K)
+                norm_features,crop_idxs = model.mask_crop_feats(crop_features,cr_dims,cl_idxs) # (M'/N,D), (M'/N,)|K|
+                cr_features = norm_features[crop_idxs > -1]
+                p_idxs = crop_idxs[crop_idxs > -1]
+                cr_cl,cr_freqs = torch.unique(p_idxs,return_counts=True) # (K',), (K',)
+                cr_ind = torch.gather(col_ind,0,cr_cl) # (K',)|num_prototypes|
+                
+                cr_sims = cr_features @ model.prototypes.T # (M'/N, num_prototypes)
+
+                sum_sims = torch.scatter_add(torch.zeros(len(clust_freqs)-1,FLAGS.num_prototypes,device=torch.device('cuda')),0, \
+                                             p_idxs[:,None].tile(1,FLAGS.num_prototypes),cr_sims) # (K,num_prototypes)
+                sum_sims = torch.index_select(sum_sims,0,cr_cl) # (K',num_prototypes)
+                mean_sims = sum_sims / cr_freqs[:,None] # (K',num_prototypes)
 
                 if FLAGS.cr_margin > 0.:
-                    pos_mask = torch.scatter(torch.zeros(cr_sims.shape[0],cr_sims.shape[1],device=torch.device('cuda')),1,p_idxs[:,None],1.)
-                    arc_sims = torch.where(pos_mask==1., torch.cos(torch.acos(cr_sims.clamp(min=-0.999)-0.001)+FLAGS.cr_margin), cr_sims)
-                    crop_loss = F.cross_entropy(arc_sims/FLAGS.temperature, p_idxs)
+                    pos_mask = torch.scatter(torch.zeros(mean_sims.shape[0],mean_sims.shape[1],device=torch.device('cuda')),1,cr_ind[:,None],1.)
+                    arc_sims = torch.where(pos_mask==1., torch.cos(torch.acos(mean_sims.clamp(min=-0.999)-0.001)+FLAGS.cr_margin), mean_sims)
+                    crop_loss = F.cross_entropy(arc_sims/FLAGS.temperature, cr_ind)
                 else:
-                    crop_loss = F.cross_entropy(cr_sims/FLAGS.temperature, p_idxs)
+                    crop_loss = F.cross_entropy(mean_sims/FLAGS.temperature, cr_ind)
+
 
                 crop_loss.backward()
 
@@ -257,7 +275,8 @@ def main(argv):
                                               torch.tensor(clust_freqs[1:,None],device=torch.device('cuda')) # (K,num_prototypes)
 
                 row_ind,col_ind = linear_sum_assignment(-mean_sims.detach().cpu().numpy())
-                cl_loss = F.cross_entropy(mean_sims/FLAGS.temperature, torch.tensor(col_ind,device=torch.device('cuda')))
+                col_ind = torch.tensor(col_ind,device=torch.device('cuda'))
+                cl_loss = F.cross_entropy(mean_sims/FLAGS.temperature, col_ind)
 
                 cl_idxs = torch.scatter(-torch.ones(final_mask.shape[0],dtype=torch.long,device=torch.device('cuda')), 0, final_mask.nonzero().reshape(-1), cl_labels) # (N,)
                 
@@ -266,9 +285,17 @@ def main(argv):
                     crop_features = F.normalize(crop_features)
                     
                     cr_features,p_idxs = model.mask_crop_feats(crop_features,cr_dims,cl_idxs) # (M'/N,D), (M'/N,)
-                    cr_sims = cr_features @ model.prototypes.T # (M'/N,K)
+                    cr_cl,cr_freqs = torch.unique(p_idxs,return_counts=True)
+                    cr_ind = torch.gather(col_ind,0,cr_cl) # (K',)|num_prototypes|
+                    
+                    cr_sims = cr_features @ model.prototypes.T # (M'/N, num_prototypes)
 
-                    crop_loss = F.cross_entropy(cr_sims/FLAGS.temperature, p_idxs)
+                    sum_sims = torch.scatter_add(torch.zeros(len(clust_freqs)-1,FLAGS.num_prototypes,device=torch.device('cuda')),0, \
+                                                 p_idxs[:,None].tile(1,FLAGS.num_prototypes),cr_sims) # (K,num_prototypes)
+                    sum_sims = torch.index_select(sum_sims,0,cr_cl) # (K',num_prototypes)
+                    mean_sims = sum_sims / cr_freqs[:,None]# (K',num_prototypes)
+
+                    crop_loss = F.cross_entropy(mean_sims/FLAGS.temperature, cr_ind)
                 
                 total_cl_loss += cl_loss
                 total_cr_loss += crop_loss
