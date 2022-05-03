@@ -43,6 +43,7 @@ flags.DEFINE_float('sobel_pix_thresh',0.2,'')
 
 flags.DEFINE_integer('num_prototypes',100,'')
 flags.DEFINE_integer('min_pts',10,'')
+flags.DEFINE_integer('min_samples',10,'')
 flags.DEFINE_float('max_clust_size',0.2,'')
 flags.DEFINE_string('selection_method','eom','')
 flags.DEFINE_float('frac_per_img',0.1,'')

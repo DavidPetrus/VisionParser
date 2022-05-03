@@ -23,7 +23,7 @@ class VisionParser(nn.Module):
         self.prototypes = F.normalize(torch.randn(FLAGS.num_prototypes,FLAGS.embd_dim,device=torch.device('cuda')))
 
         self.clusterer = hdbscan.HDBSCAN(min_cluster_size=FLAGS.min_pts, max_cluster_size=int(FLAGS.max_clust_size*FLAGS.frac_per_img*FLAGS.batch_size*32*32), \
-                                         metric='precomputed', cluster_selection_method=FLAGS.selection_method)
+                                         metric='precomputed', cluster_selection_method=FLAGS.selection_method, min_samples=FLAGS.min_samples)
 
 
     def cluster_features(self, dists):
