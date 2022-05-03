@@ -34,7 +34,6 @@ class VisionParser(nn.Module):
 
     def mask_crop_feats(self, cr_features, cr_dims, cl_idxs):
         cl_idxs = cl_idxs.reshape(cr_features.shape[0],cr_features.shape[2],cr_features.shape[3])
-
         crop_idxs = cl_idxs[:,round(cr_dims[1]*cr_features.shape[2]):round((cr_dims[1]+cr_dims[2])*cr_features.shape[2]), \
                               round(cr_dims[0]*cr_features.shape[3]):round((cr_dims[0]+cr_dims[2])*cr_features.shape[3])]
         

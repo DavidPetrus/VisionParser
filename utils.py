@@ -183,5 +183,5 @@ def plot_clusters(clust_idxs):
     for c in range(clust_idxs.max()+1):
         seg[clust_idxs==c] = color[c]
     
-    seg = cv2.resize(seg, (seg.shape[1]*8,seg.shape[0]*8))
+    seg = cv2.resize(seg, (seg.shape[1]*8,seg.shape[0]*8), interpolation=cv2.INTER_NEAREST)
     return seg

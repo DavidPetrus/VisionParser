@@ -30,10 +30,10 @@ class PascalVOC(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         img_batch = [[] for c in range(self.num_crops)]
-        crop_size_a = np.random.uniform(self.min_crop,self.max_crop)
-        crop_size_b = np.random.uniform(self.min_crop,self.max_crop)
-        crop_dims = [(np.random.uniform(0.,1.-crop_size_a),np.random.uniform(0.,1.-crop_size_a),crop_size_a), \
-                     (np.random.uniform(0.,1.-crop_size_b),np.random.uniform(0.,1.-crop_size_b),crop_size_b)]
+        crop_dims = []
+        for c in range(1,self.num_crops):
+            crop_size = np.random.uniform(self.min_crop,self.max_crop)
+            crop_dims.append((np.random.uniform(0.,1.-crop_size),np.random.uniform(0.,1.-crop_size),crop_size))
 
         image_files = np.random.choice(self.image_files,self.batch_size,replace=False)
         annots = []
