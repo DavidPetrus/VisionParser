@@ -1,16 +1,13 @@
 import numpy as np
+import cv2
 import torch
-import torch.nn.functional as F
 import glob
 import datetime
 import random
-import ast
 
 from vision_parser import VisionParser
 from dataloader import ADE20k_Dataset, PascalVOC
-from utils import color_distortion, calculate_iou, k_means, sobel_filter
-
-from scipy.optimize import linear_sum_assignment
+from utils import color_distortion, calculate_iou, vic_reg
 
 import wandb
 
@@ -22,34 +19,30 @@ flags.DEFINE_string('exp','test','')
 flags.DEFINE_string('dataset','pascal','pascal,ade')
 flags.DEFINE_string('root_dir','/home/petrus/','')
 flags.DEFINE_integer('num_workers',4,'')
-flags.DEFINE_integer('batch_size',128,'')
-flags.DEFINE_float('lr',0.001,'')
+flags.DEFINE_integer('batch_size',48,'')
+flags.DEFINE_float('lr',0.01,'')
 flags.DEFINE_integer('image_size',256,'')
 flags.DEFINE_integer('embd_dim',512,'')
-flags.DEFINE_integer('num_crops',5,'')
-flags.DEFINE_float('min_crop',0.75,'')
-flags.DEFINE_float('max_crop',0.95,'')
-flags.DEFINE_float('color_aug',0.8,'')
-flags.DEFINE_bool('main_aug',False,'')
+flags.DEFINE_integer('num_crops',3,'')
+flags.DEFINE_float('min_crop',0.55,'')
+flags.DEFINE_float('max_crop',0.75,'')
+flags.DEFINE_float('assign_thresh',0.7,'')
 
-flags.DEFINE_float('epsilon',0.001,'')
-flags.DEFINE_float('temperature',0.1,'')
-flags.DEFINE_float('cl_margin',0.4,'')
-flags.DEFINE_float('cr_margin',0.4,'')
+flags.DEFINE_integer('num_prototypes',20,'')
+flags.DEFINE_integer('min_per_img_embds',5,'')
+flags.DEFINE_integer('num_embds_per_cluster',5,'')
+flags.DEFINE_integer('min_valid_clusts',3,'')
+flags.DEFINE_float('min_sim',0.2,'')
+flags.DEFINE_bool('sg_cluster_assign',True,'')
+flags.DEFINE_integer('sinkhorn_iters',3,'')
+flags.DEFINE_bool('round_q',True,'')
+flags.DEFINE_float('epsilon',0.05,'')
 
-flags.DEFINE_float('sobel_mag_thresh',0.14,'')
-flags.DEFINE_float('sobel_pix_thresh',0.2,'')
+flags.DEFINE_float('assign_temp',1.,'')
+flags.DEFINE_float('crop_temp',5.,'')
 
-flags.DEFINE_integer('num_prototypes',150,'')
-flags.DEFINE_integer('min_pts',20,'')
-flags.DEFINE_integer('min_samples',5,'')
-flags.DEFINE_float('max_clust_size',0.2,'')
-flags.DEFINE_string('selection_method','eom','')
-flags.DEFINE_float('frac_per_img',0.1,'')
-flags.DEFINE_string('cluster_metric','cosine','')
-flags.DEFINE_bool('update_b4_crop',False,'')
-flags.DEFINE_float('noise_coeff',0.,'')
-flags.DEFINE_float('cl_coeff',3,'')
+flags.DEFINE_float('std_coeff',10.,'')
+flags.DEFINE_float('cov_coeff',10.,'')
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -100,129 +93,52 @@ def main(argv):
     color_aug = color_distortion()
 
     model = VisionParser()
-    optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
+    optimizer = torch.optim.Adam(model.net.parameters(), lr=FLAGS.lr)
 
     model.to('cuda')
+
+    zero = torch.tensor(0., dtype=torch.float32).to('cuda')
    
     print((datetime.datetime.now()-start).total_seconds())
     min_loss = 100.
     total_loss = 0.
     step_loss = 0.
     train_iter = 0
-    for epoch in range(15):
+    for epoch in range(5):
         model.train()
         # Set optimzer gradients to zero
         optimizer.zero_grad()
         for frames_load in training_generator:
             #with torch.autograd.detect_anomaly():
-            if FLAGS.main_aug:
-                image_batch = [color_aug(img.to('cuda')) for img in frames_load[0]]
-            else:
-                image_batch = [frames_load[0][0].to('cuda')] + [color_aug(img.to('cuda')) for img in frames_load[0][1:]]
+            image_batch = [color_aug(img.to('cuda')) for img in frames_load[0]]
 
             crop_dims = frames_load[1]
+            image_batch = torch.cat(image_batch, dim=0)
 
-            main_features = model.extract_feature_map(image_batch[0])
-            embds = main_features.movedim(1,3).reshape(-1, FLAGS.embd_dim)
+            feature_maps = model.extract_feature_map(image_batch)
+            fm_full,fm_a,fm_b = feature_maps[:FLAGS.batch_size],feature_maps[FLAGS.batch_size:2*FLAGS.batch_size],feature_maps[2*FLAGS.batch_size:]
 
-            sampled_indices = torch.randint(32*32,(FLAGS.batch_size, int(FLAGS.frac_per_img*32*32)),device=torch.device('cuda'))
-            sampled_mask = torch.scatter(torch.zeros(FLAGS.batch_size,32*32,dtype=torch.long,device=torch.device('cuda')), 1, sampled_indices, 1).reshape(-1).bool() # (N,)
+            assign_sims,num_clusts = model.assign_nearest_clusters(fm_full)
+            sim_magn = assign_sims.max(dim=1)[0].mean()
+            features_a, features_b, codes_a, codes_b = model.spatial_map_cluster_assign([fm_a,fm_b], assign_sims, crop_dims)
 
-            sobel_mask = sobel_filter(image_batch[0]) # N
-            final_mask = sobel_mask & sampled_mask
-            embds = embds[final_mask]
-            norm_embds = F.normalize(embds)
-            with torch.no_grad():
-                if FLAGS.cluster_metric == 'euc':
-                    dists = torch.cdist(embds.unsqueeze(0),embds.unsqueeze(0))[0]**2
-                elif FLAGS.cluster_metric == 'cosine':
-                    dists = 1 - norm_embds @ norm_embds.T
+            loss_1,crop_magn = model.loss_calc(features_a, codes_a)
+            loss_2,_ = model.loss_calc(features_b, codes_b)
+            loss = loss_1 + loss_2
 
-                cl_labels, cl_probs = model.cluster_features(dists.cpu().numpy().astype(np.float64)) # (M/N,) (M/N,)
-                cl,clust_freqs = np.unique(cl_labels, return_counts=True) # (K+1,), (K+1,)
-                cl_mask = torch.tensor(cl_labels != -1, device=torch.device('cuda'))
-                assert cl[0] == -1
+            std_loss, cov_loss = vic_reg(fm_full)
 
-            cl_labels = torch.tensor(cl_labels,device=torch.device('cuda'))
-            proto_sims = norm_embds[cl_mask] @ model.prototypes.T # (M/N, num_prototypes)
-            mean_sims = torch.scatter_add(torch.zeros(len(cl)-1,FLAGS.num_prototypes,device=torch.device('cuda')),0, \
-                                          cl_labels[cl_labels != -1][:,None].tile(1,FLAGS.num_prototypes),proto_sims) / \
-                                          torch.tensor(clust_freqs[1:,None],device=torch.device('cuda')) # (K,num_prototypes)
+            final_loss = loss + FLAGS.std_coeff*std_loss + FLAGS.cov_coeff*cov_loss
 
-            if FLAGS.noise_coeff > 0:
-                with torch.no_grad():
-                    noise_sims = norm_embds[cl_labels == -1] @ model.prototypes.T # (num_noise,num_prototypes)
-                    noise_idxs = noise_sims.argmax(dim=1) # (num_noise,)
-                    cl_labels.scatter_(0,(cl_labels==-1).nonzero().reshape(-1),-noise_idxs-2)
-
-            row_ind,col_ind = linear_sum_assignment(-mean_sims.detach().cpu().numpy())
-            col_ind = torch.tensor(col_ind,device=torch.device('cuda')) # (K,)|num_prototypes|
-            if FLAGS.cl_margin > 0.:
-                pos_mask = torch.scatter(torch.zeros(mean_sims.shape[0],mean_sims.shape[1],device=torch.device('cuda')),1,col_ind[:,None],1.)
-                arc_sims = torch.where(pos_mask==1., torch.cos(torch.acos(mean_sims.clamp(min=-0.999)-0.001)+FLAGS.cl_margin), mean_sims)
-                cl_loss = F.cross_entropy(arc_sims/FLAGS.temperature, col_ind)
-            else:
-                cl_loss = F.cross_entropy(mean_sims/FLAGS.temperature, col_ind)
-
-            (FLAGS.cl_coeff*cl_loss).backward()
-
-            if FLAGS.update_b4_crop:
-                optimizer.step()
-                optimizer.zero_grad()
-
-            cl_idxs = torch.scatter(-2*torch.ones(final_mask.shape[0],dtype=torch.long,device=torch.device('cuda')), 0, final_mask.nonzero().reshape(-1), cl_labels) # (N,)
-
-            noise_fracs = (cl_idxs.reshape(FLAGS.batch_size,32*32) < -1).sum(1) / (32*32)
-            
-            for cr_img,cr_dims in zip(image_batch[1:],crop_dims):
-                crop_features = model.extract_feature_map(cr_img)
-                crop_features = F.normalize(crop_features)
-                
-                norm_features,crop_idxs = model.mask_crop_feats(crop_features,cr_dims,cl_idxs) # (M'/N,D), (M'/N,)|K|
-                cr_features = norm_features[crop_idxs > -1]
-                p_idxs = crop_idxs[crop_idxs > -1]
-                cr_cl,cr_freqs = torch.unique(p_idxs,return_counts=True) # (K',), (K',)
-                cr_ind = torch.gather(col_ind,0,cr_cl) # (K',)|num_prototypes|
-                
-                cr_sims = cr_features @ model.prototypes.T # (M'/N, num_prototypes)
-
-                sum_sims = torch.scatter_add(torch.zeros(len(clust_freqs)-1,FLAGS.num_prototypes,device=torch.device('cuda')),0, \
-                                             p_idxs[:,None].tile(1,FLAGS.num_prototypes),cr_sims) # (K,num_prototypes)
-                sum_sims = torch.index_select(sum_sims,0,cr_cl) # (K',num_prototypes)
-                mean_sims = sum_sims / cr_freqs[:,None] # (K',num_prototypes)
-
-                if FLAGS.cr_margin > 0.:
-                    pos_mask = torch.scatter(torch.zeros(mean_sims.shape[0],mean_sims.shape[1],device=torch.device('cuda')),1,cr_ind[:,None],1.)
-                    arc_sims = torch.where(pos_mask==1., torch.cos(torch.acos(mean_sims.clamp(min=-0.999)-0.001)+FLAGS.cr_margin), mean_sims)
-                    crop_loss = F.cross_entropy(arc_sims/FLAGS.temperature, cr_ind)
-                else:
-                    crop_loss = F.cross_entropy(mean_sims/FLAGS.temperature, cr_ind)
-
-
-                if FLAGS.noise_coeff > 0.:
-                    noise_idxs = -crop_idxs[crop_idxs < -1] - 2 # (num_noise',)|num_prototypes|
-                    noise_features = norm_features[crop_idxs < -1] # (num_noise',embd_dim)
-                    noise_sims = noise_features @ model.prototypes.T # (num_noise',num_prototypes)
-
-                    noise_loss = F.cross_entropy(noise_sims/FLAGS.temperature, noise_idxs)
-                else:
-                    noise_loss = 0.
-
-                final_crop_loss = crop_loss + FLAGS.noise_coeff*noise_loss
-                final_crop_loss.backward()
-
-            log_dict = {"Epoch":epoch, "Iter":train_iter, "CL Loss": cl_loss, "Crop Loss": crop_loss, "Noise Loss": noise_loss, \
-                    "Frac Masked": 1-sobel_mask.sum()/sobel_mask.shape[0], "Crop Frac Masked": 1-p_idxs.shape[0]/sobel_mask.shape[0], \
-                    "Total Masked": 1-final_mask.sum()/final_mask.shape[0], "Avg Cluster Probability": cl_probs[cl_probs != 0].mean(), \
-                    "Frac Noise Pts": clust_freqs[0]/cl_probs.shape[0], "Num Clusters": len(clust_freqs)-1, \
-                    "Min Clust": clust_freqs[1:].min()/clust_freqs[1:].sum(), "Max Clust": clust_freqs[1:].max()/clust_freqs[1:].sum(), \
-                    "Min Noise Pts": noise_fracs.min(), "Max Noise Pts": noise_fracs.max(), "Num Noise Images": (noise_fracs == 1.).sum()}
-            
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 10000.)
-            log_dict["Grad Norm"] = grad_norm
+            final_loss.backward()
+            #grad_norm = torch.nn.utils.clip_grad_norm_(model.net.parameters(), 10000.)
 
             optimizer.step()
             optimizer.zero_grad()
+
+            log_dict = {"Epoch":epoch, "Iter":train_iter, "Loss": loss, "Std Loss": std_loss, "Cov Loss": cov_loss, \
+                        "Num Clusts Per Image": num_clusts, \
+                        "Assign Magnitude": sim_magn, "Crop Magnitude": crop_magn}
 
             '''if train_iter % 20 == 0:
                 with torch.no_grad():
@@ -242,101 +158,82 @@ def main(argv):
 
             wandb.log(log_dict)
 
-            if train_iter == 600:
+            if train_iter == 300 or train_iter == 800:
                 for g in optimizer.param_groups:
                     g['lr'] /= 10
 
         with torch.no_grad():
             val_iter = 0
-            total_cl_loss = 0.
-            total_cr_loss = 0.
-            losses_k = [0.,0.,0.,0.]
+            total_val_loss = 0.
             total_miou = 0
             total_num_ious = 0
             for frames_load in validation_generator:
-                if FLAGS.main_aug:
-                    image_batch = [color_aug(img.to('cuda')) for img in frames_load[0]]
-                else:
-                    image_batch = [frames_load[0][0].to('cuda')] + [color_aug(img.to('cuda')) for img in frames_load[0][1:]]
+                
+                image_batch = [color_aug(img.to('cuda')) for img in frames_load[0]]
 
                 crop_dims = frames_load[1]
-                main_features = model.extract_feature_map(image_batch[0])
-                embds = main_features.movedim(1,3).reshape(-1, FLAGS.embd_dim)
+                image_batch = torch.cat(image_batch, dim=0)
 
-                sampled_indices = torch.randint(32*32,(FLAGS.batch_size, int(FLAGS.frac_per_img*32*32)),device=torch.device('cuda'))
-                sampled_mask = torch.scatter(torch.zeros(FLAGS.batch_size,32*32,dtype=torch.long,device=torch.device('cuda')), 1, sampled_indices, 1).reshape(-1).bool() # (N,)
+                feature_maps = model.extract_feature_map(image_batch)
+                fm_full,fm_a,fm_b = feature_maps[:FLAGS.batch_size],feature_maps[FLAGS.batch_size:2*FLAGS.batch_size],feature_maps[2*FLAGS.batch_size:]
 
-                sobel_mask = sobel_filter(image_batch[0]) # N
-                final_mask = sobel_mask & sampled_mask
-                embds = embds[final_mask]
-                norm_embds = F.normalize(embds)
-                
-                if FLAGS.cluster_metric == 'euc':
-                    dists = torch.cdist(embds.unsqueeze(0),embds.unsqueeze(0))[0]**2
-                elif FLAGS.cluster_metric == 'cosine':
-                    dists = 1 - norm_embds @ norm_embds.T
+                assign_sims,num_clusts = model.assign_nearest_clusters(fm_full)
+                features_a, features_b, codes_a, codes_b = model.spatial_map_cluster_assign([fm_a,fm_b], assign_sims, crop_dims)
 
-                cl_labels, cl_probs = model.cluster_features(dists.cpu().numpy().astype(np.float64)) # (M/N,) (M/N,)
-                cl,clust_freqs = np.unique(cl_labels, return_counts=True) # (K+1,), (K+1,)
-                cl_mask = torch.tensor(cl_labels != -1, device=torch.device('cuda'))
-                assert cl[0] == -1
+                loss_1,_ = model.loss_calc(features_a, codes_a)
+                loss_2,_ = model.loss_calc(features_b, codes_b)
+                loss = loss_1 + loss_2
 
-                cl_labels = torch.tensor(cl_labels,device=torch.device('cuda'))
-                proto_sims = norm_embds[cl_mask] @ model.prototypes.T # (M/N, num_prototypes)
-                mean_sims = torch.scatter_add(torch.zeros(len(cl)-1,FLAGS.num_prototypes,device=torch.device('cuda')),0, \
-                                              cl_labels[cl_labels != -1][:,None].tile(1,FLAGS.num_prototypes),proto_sims) / \
-                                              torch.tensor(clust_freqs[1:,None],device=torch.device('cuda')) # (K,num_prototypes)
-
-                row_ind,col_ind = linear_sum_assignment(-mean_sims.detach().cpu().numpy())
-                col_ind = torch.tensor(col_ind,device=torch.device('cuda')) # (K,)|num_prototypes|
-                cl_loss = F.cross_entropy(mean_sims/FLAGS.temperature, col_ind)
-
-                cl_idxs = torch.scatter(-torch.ones(final_mask.shape[0],dtype=torch.long,device=torch.device('cuda')), 0, final_mask.nonzero().reshape(-1), cl_labels) # (N,)
-                
-                for cr_img,cr_dims in zip(image_batch[1:],crop_dims):
-                    crop_features = model.extract_feature_map(cr_img)
-                    crop_features = F.normalize(crop_features)
-                    
-                    norm_features,crop_idxs = model.mask_crop_feats(crop_features,cr_dims,cl_idxs) # (M'/N,D), (M'/N,)|K|
-                    cr_features = norm_features[crop_idxs > -1]
-                    p_idxs = crop_idxs[crop_idxs > -1]
-                    cr_cl,cr_freqs = torch.unique(p_idxs,return_counts=True)
-                    cr_ind = torch.gather(col_ind,0,cr_cl) # (K',)|num_prototypes|
-                    
-                    cr_sims = cr_features @ model.prototypes.T # (M'/N, num_prototypes)
-
-                    sum_sims = torch.scatter_add(torch.zeros(len(clust_freqs)-1,FLAGS.num_prototypes,device=torch.device('cuda')),0, \
-                                                 p_idxs[:,None].tile(1,FLAGS.num_prototypes),cr_sims) # (K,num_prototypes)
-                    sum_sims = torch.index_select(sum_sims,0,cr_cl) # (K',num_prototypes)
-                    mean_sims = sum_sims / cr_freqs[:,None]# (K',num_prototypes)
-
-                    crop_loss = F.cross_entropy(mean_sims/FLAGS.temperature, cr_ind)
-                
-                total_cl_loss += cl_loss
-                total_cr_loss += crop_loss
-
+                total_val_loss += loss
                 val_iter += 1
 
-                '''annots = frames_load[2]
-                miou, num_ious = calculate_iou(max_cluster_mask.to('cpu'), annots)
-                total_miou += miou
-                total_num_ious += num_ious'''
+                '''with torch.no_grad():
+                    annots = frames_load[2]
+                    miou, num_ious = calculate_iou(max_cluster_mask.to('cpu'), annots)
+                    total_miou += miou
+                    total_num_ious += num_ious'''
 
 
-            avg_cl_loss = total_cl_loss/val_iter
-            avg_cr_loss = total_cr_loss/val_iter
-            log_dict = {"Epoch":epoch, "Val CL Loss": avg_cl_loss, "Val CR Loss": avg_cr_loss}
+            avg_val_loss = total_val_loss/val_iter
+            log_dict = {"Epoch":epoch, "Val Loss": avg_val_loss, \
+                        "Val MIOU": total_miou/val_iter, "Val Num IOUS": total_num_ious/val_iter}
             
             print(log_dict)
 
             wandb.log(log_dict)
 
-            if avg_cl_loss+avg_cr_loss < min_loss:
+            if avg_val_loss < min_loss:
                 torch.save(model.state_dict(),'weights/{}.pt'.format(FLAGS.exp))
-                torch.save({'net':model.net,'proj_head':model.proj_head,'prototypes':model.prototypes},'weights/{}.pt'.format(FLAGS.exp))
-                min_loss = avg_cl_loss+avg_cr_loss
+                min_loss = avg_val_loss
         
 
 if __name__ == '__main__':
     torch.multiprocessing.set_start_method('spawn', force=True)
     app.run(main)
+
+
+
+'''overlap_dims = (max(crop_dims[0][0],crop_dims[1][0]), max(crop_dims[0][1],crop_dims[1][1]), \
+                        min(crop_dims[0][0]+crop_dims[0][2],crop_dims[1][0]+crop_dims[1][2]), min(crop_dims[0][1]+crop_dims[0][2],crop_dims[1][1]+crop_dims[1][2]))
+
+            fm_a_crop = image_batch[1][:,:, \
+                        round((overlap_dims[1]-crop_dims[0][1])*32/crop_dims[0][2])*8: \
+                        round((overlap_dims[3]-crop_dims[0][1])*32/crop_dims[0][2])*8, \
+                        round((overlap_dims[0]-crop_dims[0][0])*32/crop_dims[0][2])*8: \
+                        round((overlap_dims[2]-crop_dims[0][0])*32/crop_dims[0][2])*8] # B,c,fm_a_h,fm_a_w
+
+            fm_b_crop = image_batch[2][:,:, \
+                        round((overlap_dims[1]-crop_dims[1][1])*32/crop_dims[1][2])*8: \
+                        round((overlap_dims[3]-crop_dims[1][1])*32/crop_dims[1][2])*8, \
+                        round((overlap_dims[0]-crop_dims[1][0])*32/crop_dims[1][2])*8: \
+                        round((overlap_dims[2]-crop_dims[1][0])*32/crop_dims[1][2])*8] # B,c,fm_b_h,fm_b_w
+
+            for j,imgs in enumerate([fm_a_crop,fm_b_crop]):
+                np_imgs = imgs.movedim(1,3).to('cpu').numpy() * 255
+                print(np_imgs.mean())
+                np_imgs = np_imgs.astype(np.uint8)
+                for i,img in enumerate(np_imgs):
+                    cv2.imshow("{}_{}".format(j,i),img)
+
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()'''

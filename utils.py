@@ -5,7 +5,7 @@ import torchvision
 import cv2
 #import matplotlib.pyplot as plt
 import time
-from kornia.filters import sobel
+from sklearn.cluster import AgglomerativeClustering
 
 from absl import flags
 
@@ -51,81 +51,6 @@ def random_crop(image, crop_dims=None, min_crop=None):
     return crop, [crop_x,crop_y,crop_size]
     
 
-def k_means(x, K):
-    N = x.shape[0]
-    x = F.normalize(x)
-    step = int(N/K)
-    c = x[::step, :][:K].clone()  # (K,D) Simplistic initialization for the centroids
-    prev_c = c.clone()
-    assert c.shape[0] == K
-
-    x_i = LazyTensor(x.view(N, 1, FLAGS.embd_dim))  # (N, 1, D) samples
-    c_j = LazyTensor(c.view(1, K, FLAGS.embd_dim))  # (1, K, D) centroids
-
-    for i in range(FLAGS.niter):
-
-        # E step: assign points to the closest cluster -------------------------
-        #D_ij = ((x_i - c_j) ** 2).sum(-1)  # (N, K) symbolic squared distances
-        D_ij = 1 - (x_i | c_j) # (N, K)
-        cl = D_ij.argmin(dim=1).long().view(-1)  # (N,) Points -> Nearest cluster
-
-        # M step: update the centroids to the normalized cluster average: ------
-        # Compute the sum of points per cluster:
-        c.zero_()
-        c.scatter_add_(0, cl[:, None].repeat(1, FLAGS.embd_dim), x)
-
-        # Divide by the number of points per cluster:
-        #Ncl = torch.bincount(cl, minlength=K).type_as(c).view(K, 1)
-        #c /= Ncl  # in-place division to compute the average
-
-        c[:] = F.normalize(c)
-
-        if i > 20:
-            diff = (c - prev_c).norm()/(K**0.5)
-            if diff < FLAGS.diff_thresh:
-                break
-
-            prev_c = c.clone()
-
-    ce, num_points = concentration_estimation(D_ij,cl)
-
-    #unique,counts = torch.unique(cl,return_counts=True)
-    #print(counts.sort()[0]/cl.shape[0])
-
-    diff = (c - prev_c).norm()/(K**0.5)
-
-    return cl, c, ce, num_points, diff
-
-
-def concentration_estimation(dists,cl):
-    centroid_dists = dists.min(dim=1)[:,0] # (N,)
-    num_points_per_clust = torch.bincount(cl) # (K,)
-    if dists.shape[1]-5 < num_points_per_clust.shape[0] < dists.shape[1]:
-        print("Num Points", num_points_per_clust.shape[0], dists.shape[1])
-        num_points_per_clust = torch.bincount(cl, minlength=dists.shape[1]) # (K,)
-
-    assert num_points_per_clust.shape[0] == dists.shape[1]
-    if FLAGS.ce_root:
-        centroid_dists = torch.sqrt(torch.clamp(centroid_dists,min=0.))
-    avg_dist = torch.scatter_add(torch.zeros(dists.shape[1]).to('cuda'), 0, cl, centroid_dists) / (num_points_per_clust + 1)
-    ce = avg_dist / torch.log(num_points_per_clust + 10)
-
-    return ce, num_points_per_clust
-
-
-def sobel_filter(imgs):
-    with torch.no_grad():
-        sobel_mags = sobel(imgs).mean(1) # B,H,W
-        if FLAGS.sobel_mag_thresh > 0:
-            sobel_mags[sobel_mags < FLAGS.sobel_mag_thresh] = 0.
-            sobel_mags[sobel_mags >= FLAGS.sobel_mag_thresh] = 1.
-
-        sobel_mags = sobel_mags.reshape(FLAGS.batch_size,32,8,32,8).movedim(2,3).mean([3,4]).reshape(-1) # N
-        sobel_mask = sobel_mags < FLAGS.sobel_pix_thresh
-
-    return sobel_mask
-
-
 def vic_reg(x):
 
     x = x.movedim(1,3).reshape(FLAGS.batch_size,-1,FLAGS.embd_dim)
@@ -145,10 +70,41 @@ def off_diagonal(x):
     return x.reshape(b,-1)[:,:-1].reshape(b, n - 1, n + 1)[:,:,1:].reshape(b,-1)
 
 
-def color_distortion():
-    color_jitter = torchvision.transforms.ColorJitter(FLAGS.color_aug,FLAGS.color_aug,FLAGS.color_aug,FLAGS.color_aug*0.2)
+def color_distortion(brightness=0.8, contrast=0.8, saturation=0.8, hue=0.25):
+    color_jitter = torchvision.transforms.ColorJitter(brightness,contrast,saturation,hue)
     return color_jitter
 
+
+def sinkhorn_knopp(sims):
+    Q = torch.exp(sims / FLAGS.epsilon).t() # Q is K-by-B for consistency with notations from our paper
+    B = Q.shape[1] # number of samples to assign
+    K = Q.shape[0] # how many prototypes
+
+    # make the matrix sum to 1
+    sum_Q = torch.sum(Q)
+    Q = Q/sum_Q
+
+    for it in range(FLAGS.sinkhorn_iters):
+        # normalize each row: total weight per prototype must be 1/K
+        sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+        Q = Q/sum_of_rows
+        Q = Q/K
+
+        # normalize each column: total weight per sample must be 1/B
+        Q = Q/torch.sum(Q, dim=0, keepdim=True)
+        Q = Q/B
+
+    if FLAGS.round_q:
+        # Verify this is correct
+        max_proto_sim,_ = Q.max(dim=0)
+        Q[Q != max_proto_sim] = 0.
+        Q[Q == max_proto_sim] = 1.
+    else:
+        Q = Q*B # the columns must sum to 1 so that Q is an assignment
+
+    print(Q)
+
+    return Q.t()
 
 def calculate_iou(cluster_mask, annots):
     # cluster_mask B,num_proto,h/8,w/8
@@ -175,3 +131,14 @@ def calculate_iou(cluster_mask, annots):
         return mean_iou, num_ious / 8
 
 
+def plot_clusters(sims):
+    global color
+
+    clusters = sims.argmax(dim=1)[0].cpu().numpy()
+
+    seg = np.zeros([clusters.shape[0],clusters.shape[1],3],dtype=np.uint8)
+    for c in range(clusters.max()+1):
+        seg[clusters==c] = color[c]
+    
+    seg = cv2.resize(seg, (seg.shape[1]*8,seg.shape[0]*8))
+    return seg
